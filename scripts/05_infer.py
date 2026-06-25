@@ -25,10 +25,17 @@ Usage:
         --text "(rustig tempo, duidelijke pauzes)Goeiedag." --output test.wav
 """
 import argparse
+import json
 from pathlib import Path
 
 import soundfile as sf
 from voxcpm import VoxCPM
+
+try:
+    # LoRAConfig location varies slightly by version; try the common paths.
+    from voxcpm import LoRAConfig
+except ImportError:
+    from voxcpm.model.voxcpm2 import LoRAConfig
 
 BASE = "openbmb/VoxCPM2"
 
@@ -41,8 +48,33 @@ def find_checkpoints(root: Path) -> list[Path]:
     return found
 
 
+def load_lora_config(lora_path: Path) -> "LoRAConfig | None":
+    """
+    Build a LoRAConfig from the checkpoint's own lora_config.json so the
+    adapter is created at the rank it was TRAINED at. Without this the loader
+    falls back to a default (r=8) and weight loading fails with a size
+    mismatch against r=32 checkpoints.
+    """
+    cfg_file = lora_path / "lora_config.json"
+    if not cfg_file.exists():
+        return None
+    data = json.loads(cfg_file.read_text(encoding="utf-8"))
+    # The trainer nests the actual config under "lora_config".
+    cfg = data.get("lora_config", data)
+    return LoRAConfig(**cfg)
+
+
 def load_model(lora_path: Path) -> VoxCPM:
     print(f"Loading base + LoRA: {lora_path}")
+    lora_config = load_lora_config(lora_path)
+    if lora_config is not None:
+        return VoxCPM.from_pretrained(
+            BASE,
+            lora_config=lora_config,
+            lora_weights_path=str(lora_path),
+            load_denoiser=False,
+        )
+    # Fallback: no config file found, let the library default (may fail on r!=8)
     return VoxCPM.from_pretrained(BASE, lora_weights_path=str(lora_path),
                                   load_denoiser=False)
 
