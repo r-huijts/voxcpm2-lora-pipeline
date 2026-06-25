@@ -1,0 +1,25 @@
+# Data prep + inference dependencies for this repo.
+# NOTE: the VoxCPM2 training scripts live in the upstream OpenBMB/VoxCPM repo,
+# which you install separately (see README). `voxcpm` itself is installed from
+# that repo with `pip install -e .`, not pinned here.
+
+# Audio segmentation & manifest building
+pydub>=0.25.1
+
+# Transcription (step 2)
+faster-whisper>=1.0.0
+
+# Synthesis / inference output
+soundfile>=0.12.1
+
+# Config parsing (training launch sanity checks)
+pyyaml>=6.0
+
+# --- Provided by the upstream VoxCPM install, listed for reference ---
+# torch>=2.5.0
+# transformers
+# librosa
+# tensorboardX
+# argbind
+#
+# System dependency (not pip): ffmpeg must be on PATH.

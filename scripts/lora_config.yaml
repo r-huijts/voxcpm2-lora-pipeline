@@ -1,0 +1,49 @@
+# lora_config.yaml — VoxCPM2 single-speaker LoRA fine-tuning.
+#
+# Edit the four PATHS below, then launch with 04_train.sh.
+# Values are tuned for single-speaker voice cloning per the VoxCPM2 docs.
+
+# ---- PATHS (edit these) ----
+pretrained_path: /workspace/models/VoxCPM2        # local VoxCPM2 snapshot
+train_manifest: /workspace/voxcpm_lora/dataset/train.jsonl
+val_manifest: /workspace/voxcpm_lora/dataset/val.jsonl   # leave "" to skip validation
+save_path: /workspace/voxcpm_lora/checkpoints/lora
+tensorboard: /workspace/voxcpm_lora/logs/lora
+
+# ---- Sample rates ----
+sample_rate: 16000        # AudioVAE ENCODER input rate. Must match config.json. NOT the output rate.
+out_sample_rate: 48000    # decoder output; inference-only, ignored during training
+
+# ---- Batch / schedule ----
+batch_size: 16
+grad_accum_steps: 1       # raise to 2-4 if you hit OOM (keeps effective batch up)
+num_workers: 2
+max_batch_tokens: 8192    # lower this to filter long samples if OOM
+
+num_iters: 1000           # ~1-3 epochs for single-speaker; watch TensorBoard, don't overshoot
+max_steps: 1000
+log_interval: 10
+valid_interval: 250       # generate sample audio + mels this often
+save_interval: 250        # save a checkpoint this often so you can pick the best by ear
+
+# ---- Optimizer ----
+learning_rate: 0.0001     # 1e-4 is the LoRA rate (full-FT would be 1e-5)
+weight_decay: 0.01        # keep at 0.01 — helps prevent the "ignores text" overfit
+warmup_steps: 100
+
+# ---- Loss weights ----
+lambdas:
+  loss/diff: 1.0
+  loss/stop: 1.0          # if generation runs away after training, try raising to 1.5-2.0
+
+# ---- Anti-overfitting guardrail ----
+training_cfg_rate: 0.1    # do NOT set to 0 — 0 is the classic "model ignores input text" failure
+
+# ---- LoRA ----
+lora:
+  enable_lm: true         # LoRA on the language model
+  enable_dit: true        # essential for voice quality — keep true
+  enable_proj: false      # off for most single-speaker cases
+  r: 32                   # 32 for speaker cloning; 64 for heavier style adaptation
+  alpha: 32               # = r here; try 64 (=2r) if the voice doesn't come through strongly enough
+  dropout: 0.0            # raise only if you see overfitting
