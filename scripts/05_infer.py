@@ -28,14 +28,12 @@ import argparse
 import json
 from pathlib import Path
 
+import json
+from voxcpm.model.voxcpm2 import LoRAConfig
+
 import soundfile as sf
 from voxcpm import VoxCPM
 
-try:
-    # LoRAConfig location varies slightly by version; try the common paths.
-    from voxcpm import LoRAConfig
-except ImportError:
-    from voxcpm.model.voxcpm2 import LoRAConfig
 
 BASE = "openbmb/VoxCPM2"
 
