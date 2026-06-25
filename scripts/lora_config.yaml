@@ -9,6 +9,7 @@ train_manifest: /workspace/voxcpm2-lora-pipeline/dataset/train.jsonl
 val_manifest: /workspace/voxcpm2-lora-pipeline/dataset/val.jsonl
 save_path: /workspace/voxcpm2-lora-pipeline/checkpoints/lora_r64
 tensorboard: /workspace/voxcpm2-lora-pipeline/logs/lora_r64
+
 # ---- Sample rates ----
 sample_rate: 16000
 out_sample_rate: 48000
