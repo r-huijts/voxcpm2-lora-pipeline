@@ -18,6 +18,7 @@ TEXTS.mkdir(parents=True, exist_ok=True)
 REFS.mkdir(parents=True, exist_ok=True)
 OUTPUTS.mkdir(parents=True, exist_ok=True)
 
+
 # ---------------------------------------------------------------------------
 # Generation modes
 # ---------------------------------------------------------------------------
