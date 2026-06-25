@@ -26,6 +26,7 @@ See **[PIPELINE.md](PIPELINE.md)** for the full step-by-step runbook.
 
 ```
 scripts/
+  00_segment_srt.py     slice WAVs by SRT timing (use this if you have subtitles)
   01_segment.py         segment raw audio into 3-25s clips on silence
   02_transcribe.py      faster-whisper transcription -> .txt sidecars
   03_build_manifest.py  trim silence, filter, mix ref_audio, build JSONL

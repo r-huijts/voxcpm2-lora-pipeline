@@ -32,6 +32,23 @@ python -c "from modelscope import snapshot_download; \
 
 ## Step 1 — Segment raw audio into clips
 
+### If you already have SRT subtitles (preferred — skip transcription)
+
+When each recording has a timestamped `.srt`, use the SRT segmenter instead.
+It slices on subtitle timing, groups cues into 3–20s sentence-aligned clips,
+and writes the transcript with each clip — no Whisper, no proofreading round two.
+
+```bash
+python scripts/00_segment_srt.py --input_dir raw/ --output_dir clips/
+# SRTs in a separate folder? add:  --srt_dir srt/
+```
+
+Pairs `<name>.wav` with `<name>.srt`. Output is `clip_XXXX.wav` + `clip_XXXX.txt`
+pairs. **Then skip straight to Step 3** — Steps 1 (silence segmenter) and 2
+(transcription) below are only for raw audio with no subtitles.
+
+### If you only have raw audio (no transcripts)
+
 Cut long recordings into 3–25s clips on silence boundaries.
 
 ```bash
