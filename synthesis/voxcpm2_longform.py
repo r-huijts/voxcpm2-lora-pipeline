@@ -4,6 +4,8 @@ import subprocess
 import torch
 import soundfile as sf
 from voxcpm import VoxCPM
+import json
+from voxcpm.model.voxcpm2 import LoRAConfig
 
 torch.set_float32_matmul_precision("high")
 
@@ -248,7 +250,17 @@ def main():
     print()
 
     print("Loading VoxCPM2. This can take a few minutes...")
-    model = VoxCPM.from_pretrained("openbmb/VoxCPM2", load_denoiser=False)
+    
+    _lora_path = "/workspace/voxcpm2-lora-pipeline/checkpoints/lora/step_0000999"
+    _cfg = json.loads(open(f"{_lora_path}/lora_config.json").read())
+    _lora_config = LoRAConfig(**_cfg.get("lora_config", _cfg))
+
+    model = VoxCPM.from_pretrained(
+        "openbmb/VoxCPM2",
+        lora_config=_lora_config,
+        lora_weights_path=_lora_path,
+        load_denoiser=False,
+    )
     print("Model loaded.")
     print()
 
