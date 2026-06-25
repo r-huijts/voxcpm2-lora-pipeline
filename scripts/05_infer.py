@@ -34,6 +34,7 @@ from voxcpm.model.voxcpm2 import LoRAConfig
 import soundfile as sf
 from voxcpm import VoxCPM
 
+torch.set_float32_matmul_precision("high")
 
 BASE = "openbmb/VoxCPM2"
 
