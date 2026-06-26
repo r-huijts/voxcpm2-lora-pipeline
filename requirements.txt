@@ -1,25 +1,16 @@
-# Data prep + inference dependencies for this repo.
-# NOTE: the VoxCPM2 training scripts live in the upstream OpenBMB/VoxCPM repo,
-# which you install separately (see README). `voxcpm` itself is installed from
-# that repo with `pip install -e .`, not pinned here.
+# narrate/ pipeline dependencies
 
-# Audio segmentation & manifest building
-pydub>=0.25.1
+# Stage 1 — chunk
+portkey-ai>=1.0.0        # LLM gateway client
+pysbd>=0.3.4             # deterministic Dutch sentence segmentation
 
-# Transcription (step 2)
-faster-whisper>=1.0.0
+# Stage 2 — generate
+# voxcpm + torch + soundfile come from the main repo / upstream VoxCPM install
 
-# Synthesis / inference output
+# Stage 3 — stitch
+numpy>=1.24
 soundfile>=0.12.1
+pyloudnorm>=0.1.1        # EBU R128 / ITU-R BS.1770 loudness normalization
 
-# Config parsing (training launch sanity checks)
-pyyaml>=6.0
-
-# --- Provided by the upstream VoxCPM install, listed for reference ---
-# torch>=2.5.0
-# transformers
-# librosa
-# tensorboardX
-# argbind
-#
-# System dependency (not pip): ffmpeg must be on PATH.
+# ffmpeg (system binary) is used for reference-clip conversion in Stage 2
+# and is optional for the post-hoc atempo slow-down.

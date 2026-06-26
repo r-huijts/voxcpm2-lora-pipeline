@@ -1,80 +1,115 @@
-# voxcpm2-lora-pipeline
+# narrate/ — LLM-chunked long-form narration with the trained LoRA
 
-Tooling for cloning a voice with [VoxCPM2](https://github.com/OpenBMB/VoxCPM)
-and using it for long-form, multi-chunk narration. Built for a Dutch narration
-voice, but nothing here is language-specific.
+Three stages, run on the pod. Turns a full Dutch column into finished narration
+in the trained Mart-Smeets voice, with natural pauses and per-chunk cadence.
 
-It does two things:
+The design principle: **variable-size chunks decided by an LLM that reads the
+whole column**, not fixed rules. Each chunk is one "delivery unit" — a complete
+spoken thought. Short punches that land together stay together; long builds stay
+whole; numbers and hard names are respelled for correct pronunciation. Pauses are
+inserted at stitch time (short within a paragraph, long between paragraphs), so
+the model never has to generate silence.
 
-1. **A LoRA fine-tuning pipeline** — turn raw recordings into a trained
-   single-speaker voice (data prep → manifest → train → evaluate).
-2. **A long-form synthesis driver** — chunk long text and generate it with
-   stable cadence, with four selectable cloning modes.
+Why not one long generation: VoxCPM2 accelerates ("rushes") on long single-shot
+text. Chunking removes that at the source — each chunk is too short to drift.
 
-## Why this exists
-
-Chunked TTS voice cloning has two recurring problems: the voice subtly *drifts*
-at the start of each chunk (cold-start re-derivation from the reference), and
-prosody *resets* at chunk seams (each chunk generated without cross-chunk
-context). The synthesis driver gives you modes that trade these off differently;
-the LoRA pipeline is the path that resolves both at once — a trained voice gives
-stable timbre AND lets you keep cadence control.
-
-See **[PIPELINE.md](PIPELINE.md)** for the full step-by-step runbook.
-
-## Repo layout
+## Pipeline
 
 ```
-scripts/
-  00_segment_srt.py     slice WAVs by SRT timing (use this if you have subtitles)
-  01_segment.py         segment raw audio into 3-25s clips on silence
-  02_transcribe.py      faster-whisper transcription -> .txt sidecars
-  03_build_manifest.py  trim silence, filter, mix ref_audio, build JSONL
-  04_train.sh           launch LoRA training (single/multi-GPU)
-  05_infer.py           generate + A/B compare checkpoints
-  lora_config.yaml      training config (r=32, anti-overfit guardrails)
-synthesis/
-  voxcpm2_longform.py   interactive long-form synthesis, 4 cloning modes
-PIPELINE.md             full runbook
-requirements.txt
+column.txt
+   │  01_chunk.py   (LLM via Portkey: chunk + respell + tag + gap)
+   ▼
+plan.json   ← YOU REVIEW AND EDIT THIS
+   │  02_generate.py   (999 LoRA, Mode 1, reference re-anchor per chunk)
+   ▼
+run-dir/chunk_*.wav + manifest.json
+   │  03_stitch.py   (trim, crossfade, insert short/long pauses)
+   ▼
+final.wav
 ```
 
-## Quickstart (RunPod or any CUDA box)
+## Stage 1 — chunk (LLM)
 
 ```bash
-# 1. clone this repo
-git clone https://github.com/<you>/voxcpm2-lora-pipeline.git
-cd voxcpm2-lora-pipeline
-
-# 2. install upstream VoxCPM (provides the model + training scripts)
-git clone https://github.com/OpenBMB/VoxCPM.git
-cd VoxCPM && pip install -e . && cd ..
-
-# 3. install this repo's data-prep deps
-pip install -r requirements.txt
-# ffmpeg must also be on PATH:  apt-get install -y ffmpeg
-
-# 4. grab a local VoxCPM2 snapshot
-python -c "from modelscope import snapshot_download; \
-  snapshot_download('OpenBMB/VoxCPM2', local_dir='models/VoxCPM2')"
+pip install portkey-ai pysbd
+export PORTKEY_API_KEY=...
+python narrate/01_chunk.py --input column.txt --output plan.json --model gpt-4o
+# optional: --config-id pc-xxxx  --short-pause-ms 220  --long-pause-ms 550
 ```
 
-Then follow [PIPELINE.md](PIPELINE.md) from Step 1.
+Two steps inside Stage 1:
+1. **pySBD** splits the column into sentences deterministically (Dutch, rule-based,
+   handles abbreviations/numbers). The LLM does NOT find sentence boundaries —
+   that's the part LLMs occasionally botch.
+2. The **LLM groups** those clean sentences into delivery units, respells
+   numbers/names, and tags cadence + gaps.
 
-## The four synthesis modes (synthesis/voxcpm2_longform.py)
+The script then runs a **coverage check**: every pySBD sentence must appear in
+exactly one chunk. If the LLM drops or duplicates a sentence while grouping, you
+get a warning before generating — not a hole in the audio.
 
-| Mode | Name | Timbre source | Cadence control | Notes |
-|------|------|---------------|-----------------|-------|
-| 1 | Controllable Cloning | reference clip | yes (control tag) | best cadence; some chunk-start drift |
-| 2 | Hi-Fi Cloning | reference + transcript | no | tightest timbre; flatter cadence |
-| 3 | Voice Design | none (described) | yes | invents a voice from a description |
-| 4 | Chained Continuation | prev-chunk tail | no | best cross-seam glue; Hi-Fi cadence |
+Produces `plan.json`:
 
-Once you have a LoRA, load it in `from_pretrained(..., lora_weights_path=...)`
-and run **Mode 1** — the trained voice supplies timbre, so drift drops and you
-keep cadence control. That combination is the whole point.
+```json
+{
+  "register": "rustig, droog, licht ironisch",
+  "config": { "short_pause_ms": 220, "long_pause_ms": 550 },
+  "chunks": [
+    { "id": 1, "text": "Goeiedag. Kent u de Col de la Croix? ...",
+      "control": "rustig, uitnodigend", "gap_after": "short" },
+    { "id": 2, "text": "...tweehonderdeenenzeventig komma zeven punten...",
+      "control": "zakelijk opsommend", "gap_after": "long" }
+  ]
+}
+```
 
-## Credits & license
+**Review it.** Check the chunk boundaries match how you'd say it, fix any
+respelling (the script warns if digits survived), adjust control tags or pause
+lengths. Nothing generates until you're happy.
 
-Built on [OpenBMB/VoxCPM](https://github.com/OpenBMB/VoxCPM) (Apache-2.0). This
-tooling is released under the MIT License — see [LICENSE](LICENSE).
+## Stage 2 — generate
+
+```bash
+python narrate/02_generate.py \
+  --plan plan.json \
+  --lora /workspace/voxcpm2-lora-pipeline/checkpoints/lora/step_0000999 \
+  --reference /workspace/voxcpm_project/references/ref_voice.wav \
+  --out-dir /workspace/narration/run01
+# tuning: --cfg 1.5  --timesteps 24  --start-at 12 (resume)
+```
+
+Mode 1 (Controllable Cloning): the LoRA gives the voice, the reference clip is
+re-anchored on every chunk to fight drift, the per-chunk control tag steers
+cadence. `normalize` is OFF by default — the LLM already expanded numbers/names.
+Writes `chunk_0001.wav ...` and `manifest.json`.
+
+## Stage 3 — stitch
+
+```bash
+python narrate/03_stitch.py \
+  --run-dir /workspace/narration/run01 \
+  --output /workspace/narration/run01/final.wav
+# mastering: --loudnorm --lufs -16   (-23 broadcast, -16 podcast)
+# pause override: --short-ms 200 --long-ms 600
+```
+
+Trims each chunk's ragged edges, crossfades the seams (40 ms equal-power),
+inserts the short/long pauses per `gap_after`. Loudness mastering (`--loudnorm`)
+uses **pyloudnorm** (ITU-R BS.1770 / EBU R128 reference meter) with a true-peak
+guard. **No speed change is applied.** If the result still feels a touch fast
+overall, slow it afterward:
+
+```bash
+ffmpeg -i final.wav -filter:a "atempo=0.85" final_slow.wav   # pitch preserved
+```
+
+## Notes
+
+- **Stage 1 is the only part that needs Portkey / an LLM.** Stages 2–3 are local
+  to the pod and the model.
+- **Resume generation** with `--start-at N` if a long run is interrupted; the
+  manifest still records every chunk's gap so the stitcher has the full pattern.
+- **The LoRA loader** reads the checkpoint's own `lora_config.json` to match the
+  trained rank (r=32) — same fix as `scripts/05_infer.py`. Don't let it default.
+- **Control tags nudge, they don't command** — per the research, their effect on
+  pace is real but stochastic. The chunking and pauses do the heavy lifting.
