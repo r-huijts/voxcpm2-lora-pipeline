@@ -86,27 +86,53 @@ ademhaling worden uitgesproken. Regels:
    - Een lange zin mag een eigen fragment zijn.
    - Een losse, korte volzin mag een eigen kort fragment zijn — kort is prima \
      zolang het een hele gedachte is.
+   - MAAR: isoleer nooit een heel kort zinnetje (1-4 woorden, zoals "Goeiedag." \
+     of "Tot morgen.") als eigen fragment — de stem heeft minstens ~1,5 seconde \
+     nodig om te stabiliseren, anders klinkt het vervormd. Voeg zulke korte \
+     zinnetjes SAMEN met het aangrenzende fragment (de begroeting bij de \
+     openingszin, de afsluiter bij de vorige zin). Een dramatische pauze maak je \
+     later met stilte, niet met een los piepklein fragment.
    - Gebruik je oor: waar zou een verteller ademhalen? Dat is de grens.
 
-3. Per fragment: kies een control-tag (Nederlandse stijl/tempo-instructie) die \
-past bij DAT moment binnen de hele boog. Bijvoorbeeld: "rustig, uitnodigend", \
-"droog, met lichte spot", "trager, nadrukkelijk", "zakelijk opsommend".
+3. Bepaal per fragment de POSITITIE in de gedachtegang. Dit is de kernbeslissing \
+waar alles uit volgt:
+   - "opening": begin van een nieuwe gedachte/alinea
+   - "continuing": MIDDEN in een doorlopende gedachte — het fragment leunt vooruit \
+     naar het volgende, het mag NIET volledig afsluiten
+   - "final": einde van een gedachte/alinea — hier mag de stem volledig dalen en \
+     afsluiten
 
-4. NORMALISEER de tekst van elk fragment voor uitspraak:
+4. Kies per fragment een control-tag die ZOWEL stijl ALS intonatie-contour stuurt, \
+afgeleid van de positie:
+   - "final"     -> voeg een dalende afsluiting toe, bv "droog, dalende afsluiting" \
+     of "rustig, afsluitend, dalende toon"
+   - "continuing"-> voorkom afsluiting, bv "rustig, doorlopend, niet afsluiten" of \
+     "vertellend, vooruitleunend, niet-afsluitend"
+   - "opening"   -> bv "rustig openend"
+   Combineer met het moment-register (droog, ironisch, opsommend, nadrukkelijk).
+   Belangrijk: een "continuing" fragment dat eindigt op een punt moet TOCH \
+   doorlopend klinken — de stem hoort niet te dalen alsof het de laatste zin is, \
+   want er volgt nog meer van dezelfde gedachte.
+
+5. NORMALISEER de tekst van elk fragment voor uitspraak:
    - Schrijf getallen volledig uit in het Nederlands. Komma-decimalen: \
-     "271,7" -> "tweehonderdeenenzeventig komma zeven". "7,3" -> "zeven komma \
-     drie". "65,7" -> "vijfenzestig komma zeven".
+     "271,7" -> "tweehonderdeenenzeventig komma zeven".
    - Herspel lastige eigennamen fonetisch naar Nederlandse uitspraak. \
      Voorbeelden: "Pogačar" -> "Pogatsjar", "Narváez" -> "Narwa-es", \
-     "Carapaz" -> "Karapas". Verzonnen teamnamen ("Ruudissimo-Colnago", \
-     "Deux-Roubaix", "Flandrién Koenigsberg Elite") schrijf je zoals ze \
+     "Carapaz" -> "Karapas". Verzonnen teamnamen schrijf je zoals ze \
      uitgesproken moeten worden.
    - Laat gewone Nederlandse woorden ongemoeid.
+   - Als een fragment met een uitgeschreven getal begint, gebruik een hoofdletter.
 
-5. gap_after per fragment:
-   - "short" als het volgende fragment in DEZELFDE alinea staat
-   - "long" als er een alinea-grens volgt (de P-nummers veranderen)
-   - "none" voor het allerlaatste fragment
+6. Bepaal per fragment gap_after_ms: de stilte (in milliseconden) NA dit fragment, \
+gebaseerd op de retorische zwaarte van de grens:
+   - "continuing" fragment dat doorloopt: 0-150 ms (bijna geen stilte; de gedachte \
+     loopt door)
+   - normale zinsgrens binnen een gedachte: 200-350 ms
+   - einde van een gedachte / alinea-grens: 450-700 ms
+   - dramatische beat vóór een clou: 600-900 ms
+   - allerlaatste fragment: 0
+   Dit zijn richtlijnen; kies een passend getal per moment.
 
 Geef per fragment ook "sentences" terug: de lijst van zin-IDs (zoals "P1S1") die \
 je hebt samengevoegd, zodat we kunnen controleren dat alle zinnen precies één \
@@ -117,7 +143,7 @@ Geef UITSLUITEND geldige JSON terug, zonder uitleg, zonder markdown:
   "register": "<korte beschrijving van het overkoepelende register>",
   "chunks": [
     {"id": 1, "sentences": ["P1S1","P1S2"], "text": "...", \
-"control": "...", "gap_after": "short"},
+"position": "opening", "control": "...", "gap_after_ms": 300},
     ...
   ]
 }
@@ -186,18 +212,24 @@ def validate_plan(plan: dict, expected_sentence_ids: set[str] | None = None) -> 
     if not chunks:
         warnings.append("No chunks returned.")
         return warnings
-    valid_gaps = {"short", "long", "none"}
+    valid_positions = {"opening", "continuing", "final"}
     for i, c in enumerate(chunks):
         cid = c.get("id", i + 1)
         if not c.get("text", "").strip():
             warnings.append(f"Chunk {cid}: empty text.")
         if not c.get("control", "").strip():
             warnings.append(f"Chunk {cid}: missing control tag.")
-        if c.get("gap_after") not in valid_gaps:
-            warnings.append(f"Chunk {cid}: gap_after={c.get('gap_after')!r} "
-                            f"(expected one of {valid_gaps}).")
-    if chunks[-1].get("gap_after") != "none":
-        warnings.append("Last chunk's gap_after should be 'none'.")
+        if c.get("position") not in valid_positions:
+            warnings.append(f"Chunk {cid}: position={c.get('position')!r} "
+                            f"(expected one of {valid_positions}).")
+        gap = c.get("gap_after_ms")
+        if not isinstance(gap, (int, float)):
+            warnings.append(f"Chunk {cid}: gap_after_ms={gap!r} is not a number.")
+        elif gap < 0 or gap > 3000:
+            warnings.append(f"Chunk {cid}: gap_after_ms={gap} out of sane "
+                            f"range (0-3000).")
+    if chunks and chunks[-1].get("gap_after_ms") not in (0, 0.0):
+        warnings.append("Last chunk's gap_after_ms should be 0.")
     # Flag any digits that survived normalization.
     for c in chunks:
         if any(ch.isdigit() for ch in c.get("text", "")):
@@ -232,8 +264,11 @@ def main():
                     help="Optional Portkey config ID.")
     ap.add_argument("--api-key", default=os.environ.get("PORTKEY_API_KEY"),
                     help="Portkey API key (or set PORTKEY_API_KEY).")
-    ap.add_argument("--short-pause-ms", type=int, default=220)
-    ap.add_argument("--long-pause-ms", type=int, default=550)
+    ap.add_argument("--gap-scale", type=float, default=1.0,
+                    help="Global multiplier on all per-chunk gaps at stitch time "
+                         "(1.2 = 20%% longer pauses everywhere).")
+    ap.add_argument("--crossfade-ms", type=int, default=40,
+                    help="Crossfade floor at every seam, even zero-gap ones.")
     args = ap.parse_args()
 
     if not args.api_key:
@@ -266,10 +301,10 @@ def main():
         dump.write_text(raw, encoding="utf-8")
         sys.exit(f"Could not parse JSON: {e}\nRaw model output saved to {dump}")
 
-    # Inject pause config (kept with the plan so the stitcher is self-contained).
+    # Stitch config: gaps are per-chunk (gap_after_ms). These are global knobs.
     plan.setdefault("config", {})
-    plan["config"]["short_pause_ms"] = args.short_pause_ms
-    plan["config"]["long_pause_ms"] = args.long_pause_ms
+    plan["config"]["gap_scale"] = args.gap_scale
+    plan["config"]["crossfade_ms"] = args.crossfade_ms
 
     warnings = validate_plan(plan, expected_sentence_ids=expected_ids)
 

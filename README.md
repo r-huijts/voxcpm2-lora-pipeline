@@ -48,24 +48,22 @@ The script then runs a **coverage check**: every pySBD sentence must appear in
 exactly one chunk. If the LLM drops or duplicates a sentence while grouping, you
 get a warning before generating — not a hole in the audio.
 
-Produces `plan.json`:
+Produces `plan.json`. Each chunk carries:
+- `position`: `opening` | `continuing` | `final` — the chunk's role in the
+  thought-arc. This drives everything else.
+- `control`: style **plus an intonation hint** derived from position — a `final`
+  chunk gets a falling close ("dalende afsluiting"), a `continuing` chunk is told
+  not to resolve ("doorlopend, niet afsluiten"). Targets the "every chunk sounds
+  like a full stop" problem on the Mode 1 path.
+- `gap_after_ms`: a per-chunk numeric pause, sized to the rhetorical weight of the
+  break — ~0-150 ms mid-thought, 200-350 between sentences, 450-700 at a thought
+  end, 600-900 before a punchline.
+- `sentences`: the pySBD sentence IDs grouped into this chunk (for the coverage
+  check).
 
-```json
-{
-  "register": "rustig, droog, licht ironisch",
-  "config": { "short_pause_ms": 220, "long_pause_ms": 550 },
-  "chunks": [
-    { "id": 1, "text": "Goeiedag. Kent u de Col de la Croix? ...",
-      "control": "rustig, uitnodigend", "gap_after": "short" },
-    { "id": 2, "text": "...tweehonderdeenenzeventig komma zeven punten...",
-      "control": "zakelijk opsommend", "gap_after": "long" }
-  ]
-}
-```
-
-**Review it.** Check the chunk boundaries match how you'd say it, fix any
-respelling (the script warns if digits survived), adjust control tags or pause
-lengths. Nothing generates until you're happy.
+**Review it.** The `position` field makes the LLM's judgment inspectable — you can
+see at a glance which chunks it thinks resolve vs. flow, and correct that directly.
+Editing a pause is just changing the `gap_after_ms` integer.
 
 ## Stage 2 — generate
 
@@ -90,14 +88,14 @@ python narrate/03_stitch.py \
   --run-dir /workspace/narration/run01 \
   --output /workspace/narration/run01/final.wav
 # mastering: --loudnorm --lufs -16   (-23 broadcast, -16 podcast)
-# pause override: --short-ms 200 --long-ms 600
+# scale all pauses: --gap-scale 1.2  (20% longer everywhere)
 ```
 
-Trims each chunk's ragged edges, crossfades the seams (40 ms equal-power),
-inserts the short/long pauses per `gap_after`. Loudness mastering (`--loudnorm`)
-uses **pyloudnorm** (ITU-R BS.1770 / EBU R128 reference meter) with a true-peak
-guard. **No speed change is applied.** If the result still feels a touch fast
-overall, slow it afterward:
+Trims each chunk's ragged edges, crossfades the seams (40 ms equal-power floor,
+applied even at zero-gap seams so flowing chunks butt together cleanly), inserts
+each chunk's `gap_after_ms` pause (optionally scaled by `--gap-scale`). Loudness
+mastering (`--loudnorm`) uses **pyloudnorm** (EBU R128) with a true-peak guard.
+**No speed change is applied.** If still a touch fast, slow it afterward:
 
 ```bash
 ffmpeg -i final.wav -filter:a "atempo=0.85" final_slow.wav   # pitch preserved

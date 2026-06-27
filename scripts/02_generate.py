@@ -105,6 +105,12 @@ def main():
     ap.add_argument("--normalize", action="store_true", default=False,
                     help="Let the model normalize text. OFF by default because "
                          "the chunking LLM already expanded numbers/names.")
+    ap.add_argument("--no-control", action="store_true", default=False,
+                    help="Ignore the per-chunk control tags (test whether the "
+                         "tags are over-steering / making delivery unnatural).")
+    ap.add_argument("--simple-control", default=None,
+                    help="Override ALL per-chunk tags with one mild tag, e.g. "
+                         "'rustig'. Use to test milder cadence steering.")
     ap.add_argument("--start-at", type=int, default=1,
                     help="Resume: skip chunks with id < this (1-indexed).")
     args = ap.parse_args()
@@ -141,14 +147,18 @@ def main():
         cid = int(c["id"])
         text = c["text"]
         control = c.get("control", "")
-        gap_after = c.get("gap_after", "short")
+        if args.no_control:
+            control = ""
+        elif args.simple_control is not None:
+            control = args.simple_control
+        gap_after_ms = c.get("gap_after_ms", 300)
         wav_name = f"chunk_{cid:04d}.wav"
         wav_path = args.out_dir / wav_name
 
         # Always record in manifest so the stitcher has the full pattern,
         # even for chunks skipped on resume.
         manifest["items"].append({
-            "id": cid, "file": wav_name, "gap_after": gap_after,
+            "id": cid, "file": wav_name, "gap_after_ms": gap_after_ms,
             "control": control,
         })
 

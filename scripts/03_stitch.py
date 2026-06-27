@@ -99,11 +99,11 @@ def main():
     ap.add_argument("--run-dir", required=True, type=Path,
                     help="Dir with chunk wavs + manifest.json from 02_generate.")
     ap.add_argument("--output", required=True, type=Path)
-    ap.add_argument("--short-ms", type=int, default=None,
-                    help="Override short pause (else from manifest config).")
-    ap.add_argument("--long-ms", type=int, default=None,
-                    help="Override long pause (else from manifest config).")
-    ap.add_argument("--crossfade-ms", type=int, default=40)
+    ap.add_argument("--gap-scale", type=float, default=None,
+                    help="Global multiplier on all per-chunk gaps "
+                         "(else from manifest config; default 1.0).")
+    ap.add_argument("--crossfade-ms", type=int, default=None,
+                    help="Crossfade at every seam (else from manifest config).")
     ap.add_argument("--no-trim", action="store_true",
                     help="Don't trim per-chunk leading/trailing silence.")
     ap.add_argument("--loudnorm", action="store_true",
@@ -121,11 +121,11 @@ def main():
         sys.exit("Manifest has no items.")
 
     cfg = manifest.get("config", {})
-    short_ms = args.short_ms if args.short_ms is not None else cfg.get("short_pause_ms", 220)
-    long_ms = args.long_ms if args.long_ms is not None else cfg.get("long_pause_ms", 550)
+    gap_scale = args.gap_scale if args.gap_scale is not None else cfg.get("gap_scale", 1.0)
+    crossfade_ms = args.crossfade_ms if args.crossfade_ms is not None else cfg.get("crossfade_ms", 40)
 
-    print(f"Stitching {len(items)} chunks (short={short_ms}ms, long={long_ms}ms, "
-          f"crossfade={args.crossfade_ms}ms)")
+    print(f"Stitching {len(items)} chunks "
+          f"(gap_scale={gap_scale}, crossfade={crossfade_ms}ms)")
 
     timeline = None
     sr = None
@@ -148,15 +148,12 @@ def main():
         if timeline is None:
             timeline = audio
         else:
-            timeline = equal_power_crossfade(timeline, audio, sr,
-                                             args.crossfade_ms)
+            timeline = equal_power_crossfade(timeline, audio, sr, crossfade_ms)
 
-        gap = item.get("gap_after", "short")
-        if gap == "short":
-            timeline = np.concatenate([timeline, silence(sr, short_ms)])
-        elif gap == "long":
-            timeline = np.concatenate([timeline, silence(sr, long_ms)])
-        # "none" -> nothing
+        # Per-chunk numeric gap, scaled globally.
+        gap_ms = float(item.get("gap_after_ms", 300)) * gap_scale
+        if gap_ms > 0:
+            timeline = np.concatenate([timeline, silence(sr, int(round(gap_ms)))])
 
     # Optional loudness normalization (in-memory, pyloudnorm).
     if args.loudnorm:
