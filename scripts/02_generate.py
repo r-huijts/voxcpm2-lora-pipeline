@@ -83,11 +83,21 @@ def convert_reference(src: Path, dst: Path) -> Path:
     )
     return dst
 
+PRIMER = "... "
 
 def apply_control(text: str, control: str) -> str:
     """Controllable Cloning convention: (instruction)text, no space."""
     control = (control or "").strip()
     return f"({control}){text}" if control else text
+
+
+def apply_primer(text: str) -> str:
+    """
+    Prepend a short ellipsis primer to the first chunk so the TTS voice
+    has time to stabilise before the first word. The stitcher's trim_silence
+    will remove any leading silence or artifact the primer produces.
+    """
+    return PRIMER + text
 
 
 def main():
@@ -179,7 +189,9 @@ def main():
             print(f"[{cid:03d}] skipped (resume)")
             continue
 
-        controlled = apply_control(text, control)
+        # Prepend primer to the very first chunk only.
+        text_for_tts = apply_primer(text) if cid == 1 else text
+        controlled = apply_control(text_for_tts, control)
         print(f"[{cid:03d}] ({control}) {text[:64]}"
               f"{'...' if len(text) > 64 else ''}")
 

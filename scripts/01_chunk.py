@@ -201,6 +201,9 @@ Lees tot slot alle control instructions als reeks terug. Ze moeten samen
 een coherente boog vormen over de column — tempo en register verschuiven
 geleidelijk en doelbewust. De reeks tags is het pacing-script voor het
 geheel.
+Het allerlaatste fragment krijgt altijd een control instruction die
+afsluiting en rust uitdrukt (bv. "slow, dry, settled, heavy").
+Geen uitzonderingen.
 ════════════════════════════════════════════════════════
 STAP 5 — NORMALISEER de tekst voor uitspraak
 ════════════════════════════════════════════════════════
@@ -232,6 +235,8 @@ Schrijf de tekst van elk fragment uitspreekvriendelijk:
       zet een hoofdletter op het eerste woord.
     • Na normalisatie mogen er GEEN losse cijfers (0–9) meer in de tekst \
       staan. Controleer dit expliciet.
+  VASTE VERVANGINGEN: 
+    "Phoenix Poule" → "Phoenix Poel"
 
 ════════════════════════════════════════════════════════
 STAP 6 — GAP AFTER (ms)
