@@ -32,6 +32,30 @@ import pysbd
 from portkey_ai import Portkey
 
 
+def _load_dotenv():
+    """
+    Load KEY=VALUE lines from a .env file (repo root, then narrate/) into the
+    environment, without overwriting anything already set. Lets you keep
+    PORTKEY_API_KEY in a gitignored .env instead of pasting it each run.
+    """
+    here = Path(__file__).resolve().parent
+    candidates = [here.parent / ".env", here / ".env"]
+    for env_path in candidates:
+        if not env_path.exists():
+            continue
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            # Strip optional surrounding quotes.
+            val = val.strip().strip('"').strip("'")
+            os.environ.setdefault(key.strip(), val)
+
+
+_load_dotenv()
+
+
 def split_sentences(column: str) -> list[dict]:
     """
     Deterministically split the column into sentences with pySBD (Dutch),

@@ -34,7 +34,15 @@ final.wav
 pip install portkey-ai pysbd
 export PORTKEY_API_KEY=...
 python narrate/01_chunk.py --input column.txt --output plan.json --model gpt-4o
-# optional: --config-id pc-xxxx  --short-pause-ms 220  --long-pause-ms 550
+# optional: --config-id pc-xxxx  --gap-scale 1.0  --crossfade-ms 40
+```
+
+**Avoid pasting the key each run:** copy `.env.example` to `.env` in the repo
+root and put your key there. `01_chunk.py` loads it automatically; `.env` is
+gitignored so it never gets pushed.
+
+```bash
+cp .env.example .env && nano .env   # set PORTKEY_API_KEY
 ```
 
 Two steps inside Stage 1:
