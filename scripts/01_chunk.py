@@ -157,24 +157,45 @@ in het volgende fragment doorgaat.
 STAP 4 — CONTROL INSTRUCTION
 ════════════════════════════════════════════════════════
 Schrijf per fragment een korte Engelstalige control instruction.
-Dit is een directe aanwijzing aan de TTS-stem — een compacte cue, geen
-beschrijving voor een menselijke lezer.
+Dit is een directe aanwijzing aan de TTS-stem — een compacte technische
+cue, geen beschrijving voor een menselijke lezer.
 
 Regels:
   - Maximaal acht woorden. Kommalijst van eigenschappen, geen zinnen.
-  - Dek in die acht woorden: tempo/energie en emotionele kleur.
+  - Gebruik uitsluitend technische leveringsbeschrijvingen: tempo, energie,
+    volume, toon. Voorbeelden van goede woorden: dry, measured, brisk,
+    unhurried, slow, light, heavy, forward, settled, composed, clipped.
+  - Geen dramatische of interpretatieve instructies zoals "ironic", "wry",
+    "deadpan", "conspiratorial", "climax", "weight", "finality", "lands
+    harder". De ironie zit in de tekst en de timing — niet in de stem die
+    opdracht krijgt het te spelen. De TTS voert dramatische instructies
+    letterlijk en overdreven uit.
   - De "position" gebruik je alleen als redeneersteiger om de juiste toon
     te kiezen — het woord "continuing", "final" of "opening" verschijnt
     NOOIT in de control instruction zelf.
-      • "continuing": de gedachte is nog niet af — kies energie en toon
-        die dat weerspiegelen (bv. "dry, brisk", "measured, intent")
-      • "final": de gedachte landt — kies rust en afsluiting
-        (bv. "slow, dry, settled", "deliberate")
-      • "opening": neutraal, opengaand (bv. "measured, dry")
+      • "continuing": kies energie die past bij een gedachte die nog
+        loopt (bv. "dry, brisk", "measured, forward")
+      • "final": kies rust en gewicht (bv. "slow, dry, settled",
+        "measured, heavy")
+      • "opening": licht en open (bv. "measured, dry", "light, brisk")
 
 Goed: "dry, measured, deliberate"
-Fout: "Measured and slightly wry; the list of monuments is clipped and
-dry, then delivered with understated irony — no falling tone at the end."
+Fout: "Measured and slightly wry; delivered with understated irony —
+no falling tone at the end."
+
+Kijk bij het toewijzen van control instructions naar de semantische
+samenhang tussen opeenvolgende fragmenten. Fragmenten die samen één
+gedachte vormen krijgen tags die prosodisch op elkaar aansluiten —
+vergelijkbaar tempo, vergelijkbare energie. Zo ontstaat een natuurlijke
+beweging binnen elke gedachtegang: opbouw, draag, afsluiting.
+
+Gebruik tempo als het voornaamste verbindingsmiddel:
+  - Aaneengesloten fragmenten binnen één gedachte: consistent tempo,
+    geen plotse versnelling of vertraging tussen hen.
+  - Het sluitende fragment van een gedachte: iets langzamer en zwaarder
+    dan de fragmenten ervoor.
+  - Het openingsfragment van een nieuwe gedachte: iets lichter en opener
+    dan het sluitende fragment ervoor.
 
 Lees tot slot alle control instructions als reeks terug. Ze moeten samen
 een coherente boog vormen over de column — tempo en register verschuiven
