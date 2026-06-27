@@ -156,27 +156,30 @@ in het volgende fragment doorgaat.
 ════════════════════════════════════════════════════════
 STAP 4 — CONTROL INSTRUCTION
 ════════════════════════════════════════════════════════
-Schrijf per fragment een korte Engelstalige control instruction. \
-Dit is een directe aanwijzing aan de TTS-stem, vergelijkbaar met een \
-regieaanwijzing aan een stemacteur.
+Schrijf per fragment een korte Engelstalige control instruction.
+Dit is een directe aanwijzing aan de TTS-stem — een compacte cue, geen
+beschrijving voor een menselijke lezer.
 
-De instruction beschrijft voor DIT specifieke fragment:
-  1. Hoe de stem klinkt qua tempo en energie (bv. slow, measured, brisk)
-  2. De emotionele kleur of houding (bv. dry, ironic, matter-of-fact, \
-     understated warmth)
-  3. Het prosodisch gedrag aan het einde van het fragment — dit is cruciaal:
-       - "continuing" fragmenten: de stem mag NIET dalen of afsluiten; \
-         beschrijf dat expliciet (bv. "no falling tone at the end", \
-         "voice carries forward, no resolution")
-       - "final" fragmenten: de stem sluit volledig af \
-         (bv. "full falling close", "settles and resolves")
-       - "opening" fragmenten: neutraal en opengaand
+Regels:
+  - Maximaal acht woorden. Kommalijst van eigenschappen, geen zinnen.
+  - Dek in die acht woorden: tempo/energie en emotionele kleur.
+  - De "position" gebruik je alleen als redeneersteiger om de juiste toon
+    te kiezen — het woord "continuing", "final" of "opening" verschijnt
+    NOOIT in de control instruction zelf.
+      • "continuing": de gedachte is nog niet af — kies energie en toon
+        die dat weerspiegelen (bv. "dry, brisk", "measured, intent")
+      • "final": de gedachte landt — kies rust en afsluiting
+        (bv. "slow, dry, settled", "deliberate")
+      • "opening": neutraal, opengaand (bv. "measured, dry")
 
-Schrijf de instruction als een compacte Engelse frase of korte zin. \
-Geen opsomming, geen bullets — gewoon een vloeiende stijlbeschrijving. \
-Laat je leiden door wat dit fragment nodig heeft; er is geen vaste \
-woordenlijst.
+Goed: "dry, measured, deliberate"
+Fout: "Measured and slightly wry; the list of monuments is clipped and
+dry, then delivered with understated irony — no falling tone at the end."
 
+Lees tot slot alle control instructions als reeks terug. Ze moeten samen
+een coherente boog vormen over de column — tempo en register verschuiven
+geleidelijk en doelbewust. De reeks tags is het pacing-script voor het
+geheel.
 ════════════════════════════════════════════════════════
 STAP 5 — NORMALISEER de tekst voor uitspraak
 ════════════════════════════════════════════════════════
