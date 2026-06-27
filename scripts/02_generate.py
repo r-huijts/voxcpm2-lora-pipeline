@@ -113,6 +113,19 @@ def main():
                          "'rustig'. Use to test milder cadence steering.")
     ap.add_argument("--start-at", type=int, default=1,
                     help="Resume: skip chunks with id < this (1-indexed).")
+    ap.add_argument("--retry-badcase", action="store_true", default=True,
+                    help="Auto-retry chunks whose audio/text duration ratio is "
+                         "abnormal (catches cut-short tails and ghost-sound / "
+                         "non-clean stops). On by default.")
+    ap.add_argument("--no-retry-badcase", dest="retry_badcase",
+                    action="store_false",
+                    help="Disable the bad-case retry.")
+    ap.add_argument("--retry-ratio", type=float, default=6.0,
+                    help="Audio-to-text duration ratio above which a generation "
+                         "is retried. Raise (e.g. 8-10) for deliberately slow "
+                         "speech so good slow chunks aren't falsely retried.")
+    ap.add_argument("--retry-max", type=int, default=3,
+                    help="Max retries per chunk before keeping the last attempt.")
     args = ap.parse_args()
 
     if not args.plan.exists():
@@ -176,6 +189,9 @@ def main():
             cfg_value=args.cfg,
             inference_timesteps=args.timesteps,
             normalize=args.normalize,
+            retry_badcase=args.retry_badcase,
+            retry_badcase_max_times=args.retry_max,
+            retry_badcase_ratio_threshold=args.retry_ratio,
         )
         sf.write(wav_path, wav, model.tts_model.sample_rate)
 
