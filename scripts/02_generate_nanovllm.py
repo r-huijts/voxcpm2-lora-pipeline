@@ -20,6 +20,22 @@ plain voxcpm. Key differences:
     preceding intonation contour — so intonation flows across chunk seams
     instead of resetting at each boundary.
 
+  ASR RETRY LOOP  (new)
+    After each chunk is generated, faster-whisper transcribes the audio and
+    jiwer computes Word Error Rate (WER) against the input text. If WER exceeds
+    --wer-threshold the chunk is regenerated (up to --max-retries times). The
+    attempt with the lowest WER is kept. This replicates ElevenLabs' Request
+    Stitching quality gate — bad chunks are caught and retried automatically
+    instead of surfacing in the final stitch.
+
+    Install deps once:
+        pip install faster-whisper jiwer
+
+    Disable entirely with --no-asr. Tune aggressiveness with:
+        --wer-threshold 0.20   (default 0.15 — higher = more permissive)
+        --max-retries 2        (default 2, matching ElevenLabs behaviour)
+        --whisper-model base   (default; use large-v3 for precision QC)
+
   LORA
     Your fine-tuned LoRA checkpoint is loaded once at server init via
     LoRAConfig (read from lora_config.json in the checkpoint dir). The
@@ -39,12 +55,20 @@ Usage:
         --reference /workspace/voxcpm_project/references/ref_voice.wav \\
         --out-dir /workspace/narration/run01
 
+    # with ASR quality gate
+    python 02_generate_nanovllm.py --plan plan.json --lora ... --reference ... \\
+        --out-dir ... --wer-threshold 0.15 --max-retries 2 --whisper-model base
+
+    # disable ASR gate
+    python 02_generate_nanovllm.py --plan plan.json --lora ... --reference ... \\
+        --out-dir ... --no-asr
+
     # tuning knobs
     python 02_generate_nanovllm.py --plan plan.json --lora ... --reference ... \\
         --out-dir ... --cfg 2.0 --timesteps 30 --prosody-tail 6.0
 
-Requires: nano-vllm-voxcpm, soundfile, torchaudio
-    pip install nano-vllm-voxcpm soundfile torchaudio
+Requires: nano-vllm-voxcpm, soundfile, torchaudio, faster-whisper, jiwer
+    pip install nano-vllm-voxcpm soundfile torchaudio faster-whisper jiwer
 """
 import argparse
 import io
@@ -123,14 +147,154 @@ torch.set_float32_matmul_precision("high")
 
 BASE_MODEL = "openbmb/VoxCPM2"
 
-# Short neutral Dutch seed — long enough (~3-4 s of speech) to give the
-# AudioVAE a stable voice anchor, short enough not to burn context budget.
-# This text is registered as prompt_text alongside the seed audio; it is
-# never included in the final output.
 SEED_TEXT = (
     "Goedemiddag. Dit is een korte inleiding om de stem te kalibreren. "
     "We beginnen zo meteen met het eigenlijke verslag."
 )
+
+
+# ── ASR quality gate ───────────────────────────────────────────────────────
+
+def _load_asr(whisper_model: str):
+    """Lazy-load faster-whisper. Returns None if not installed."""
+    try:
+        from faster_whisper import WhisperModel
+        print(f"[asr] Loading faster-whisper '{whisper_model}'...")
+        model = WhisperModel(whisper_model, device="cuda", compute_type="float16")
+        print(f"[asr] Ready.\n")
+        return model
+    except ImportError:
+        print(
+            "[asr] WARNING: faster-whisper not installed. ASR retry disabled.\n"
+            "         Install with: pip install faster-whisper jiwer",
+            file=sys.stderr,
+        )
+        return None
+
+
+def _transcribe(asr_model, audio: np.ndarray, sr: int) -> str:
+    """Transcribe audio array to text using faster-whisper."""
+    buf = io.BytesIO()
+    sf.write(buf, audio, sr, format="WAV", subtype="PCM_16")
+    buf.seek(0)
+    segments, _ = asr_model.transcribe(buf, language="nl", beam_size=5)
+    return " ".join(s.text.strip() for s in segments).strip()
+
+
+def _compute_wer(reference: str, hypothesis: str) -> float:
+    """Compute Word Error Rate between reference text and ASR hypothesis."""
+    try:
+        from jiwer import wer, transforms
+        # Minimal Dutch normalization: lowercase, strip punctuation.
+        transform = transforms.Compose([
+            transforms.ToLowerCase(),
+            transforms.RemovePunctuation(),
+            transforms.RemoveMultipleSpaces(),
+            transforms.Strip(),
+        ])
+        return wer(reference, hypothesis, truth_transform=transform,
+                   hypothesis_transform=transform)
+    except ImportError:
+        # Fallback: naive word-overlap WER without jiwer.
+        ref_words = reference.lower().split()
+        hyp_words = hypothesis.lower().split()
+        if not ref_words:
+            return 0.0
+        # Levenshtein at word level — simple DP.
+        m, n = len(ref_words), len(hyp_words)
+        dp = list(range(n + 1))
+        for i in range(1, m + 1):
+            prev, dp[0] = dp[0], i
+            for j in range(1, n + 1):
+                temp = dp[j]
+                if ref_words[i - 1] == hyp_words[j - 1]:
+                    dp[j] = prev
+                else:
+                    dp[j] = 1 + min(prev, dp[j], dp[j - 1])
+                prev = temp
+        return dp[n] / m
+
+
+def generate_with_retry(
+    server,
+    text: str,
+    prompt_id,
+    ref_latents,
+    zero_shot_latents,
+    cfg: float,
+    temperature: float,
+    max_generate_length: int,
+    lora_name: str,
+    asr_model,
+    wer_threshold: float,
+    max_retries: int,
+    sample_rate: int,
+) -> tuple[np.ndarray, float, int]:
+    """
+    Generate audio for one chunk, retrying if WER exceeds threshold.
+
+    Returns (best_audio, best_wer, attempts_used).
+    best_wer is -1.0 if ASR was skipped.
+    """
+    def _generate_once(ref_audio_latents) -> np.ndarray:
+        if prompt_id is not None:
+            gen = server.generate(
+                target_text=text,
+                prompt_id=prompt_id,
+                ref_audio_latents=ref_audio_latents,
+                cfg_value=cfg,
+                temperature=temperature,
+                max_generate_length=max_generate_length,
+                lora_name=lora_name,
+            )
+        else:
+            gen = server.generate(
+                target_text=text,
+                ref_audio_latents=ref_audio_latents or zero_shot_latents,
+                cfg_value=cfg,
+                temperature=temperature,
+                max_generate_length=max_generate_length,
+                lora_name=lora_name,
+            )
+        return collect_chunks(gen)
+
+    best_audio = None
+    best_wer = float("inf")
+    attempts = 0
+
+    for attempt in range(1, max_retries + 2):  # +2: initial attempt + max_retries
+        attempts = attempt
+        wav = _generate_once(ref_latents)
+        wav = trim_silence(wav, sample_rate)
+
+        if asr_model is None:
+            # No ASR — accept immediately.
+            return wav, -1.0, attempts
+
+        transcript = _transcribe(asr_model, wav, sample_rate)
+        current_wer = _compute_wer(text, transcript)
+
+        if best_audio is None or current_wer < best_wer:
+            best_audio = wav
+            best_wer = current_wer
+
+        wer_pct = f"{current_wer * 100:.1f}%"
+        if current_wer <= wer_threshold:
+            if attempt > 1:
+                print(f"         [asr] attempt {attempt}: WER={wer_pct} ✓ accepted")
+            else:
+                print(f"         [asr] WER={wer_pct} ✓")
+            return best_audio, best_wer, attempts
+
+        # Threshold exceeded.
+        if attempt <= max_retries:
+            print(f"         [asr] attempt {attempt}: WER={wer_pct} > "
+                  f"{wer_threshold * 100:.0f}% — retrying...")
+        else:
+            print(f"         [asr] attempt {attempt}: WER={wer_pct} — "
+                  f"retries exhausted, keeping best ({best_wer * 100:.1f}%)")
+
+    return best_audio, best_wer, attempts
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -140,11 +304,7 @@ def load_lora_config(lora_path: Path) -> LoRAConfig:
     if not cfg_file.exists():
         sys.exit(f"No lora_config.json found in {lora_path}")
     data = json.loads(cfg_file.read_text(encoding="utf-8"))
-    # The training pipeline wraps config under "lora_config" key; handle both.
     cfg = data.get("lora_config", data)
-    # Map training checkpoint fields to nano-vllm-voxcpm's LoRAConfig schema.
-    # Training uses: r, alpha, dropout
-    # Inference uses: max_lora_rank, max_loras (alpha and dropout dropped)
     mapped = {
         "enable_lm":           cfg.get("enable_lm", True),
         "enable_dit":          cfg.get("enable_dit", True),
@@ -161,7 +321,6 @@ def load_lora_config(lora_path: Path) -> LoRAConfig:
 
 
 def wav_to_bytes(path: Path, target_sr: int) -> bytes:
-    """Load any audio file, resample to target_sr, convert to mono WAV bytes."""
     wav, sr = torchaudio.load(str(path))
     if sr != target_sr:
         wav = torchaudio.functional.resample(wav, sr, target_sr)
@@ -185,7 +344,6 @@ def trim_silence(
     keep_ms: int = 40,
     max_trim_ms: int = 800,
 ) -> np.ndarray:
-    """Trim leading/trailing silence, keeping a small natural pad."""
     amp = np.abs(audio)
     if amp.max() <= 0:
         return audio
@@ -214,7 +372,6 @@ def collect_chunks(generator) -> np.ndarray:
 
 
 def apply_control(text: str, control: str) -> str:
-    """Controllable Cloning convention: (instruction)text, no space."""
     control = (control or "").strip()
     return f"({control}){text}" if control else text
 
@@ -224,48 +381,38 @@ def apply_control(text: str, control: str) -> str:
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--plan", required=True, type=Path,
-                    help="plan.json from 01_chunk.py (reviewed and edited).")
-    ap.add_argument("--lora", required=True, type=Path,
-                    help="LoRA checkpoint dir (must contain lora_config.json "
-                         "and *.safetensors weights).")
-    ap.add_argument("--reference", required=True, type=Path,
-                    help="Reference voice clip (WAV/FLAC/MP3) to clone from.")
-    ap.add_argument("--reference-text", default="",
-                    help="Transcript of the reference clip (inline). Strongly "
-                         "recommended — improves cloning quality and prevents "
-                         "the model speaking stray words. Leave empty for "
-                         "zero-shot cloning from audio alone.")
-    ap.add_argument("--reference-text-file", type=Path, default=None,
-                    help="Path to a .txt file containing the reference "
-                         "transcript. Takes precedence over --reference-text.")
-    ap.add_argument("--out-dir", required=True, type=Path,
-                    help="Output directory for chunk wavs + manifest.json.")
-    ap.add_argument("--cfg", type=float, default=2.0,
-                    help="cfg_value / guidance scale (default 2.0).")
-    ap.add_argument("--timesteps", type=int, default=20,
-                    help="inference_timesteps (default 30; no speed pressure "
-                         "so use 30 for quality).")
-    ap.add_argument("--temperature", type=float, default=1.0,
-                    help="Sampling temperature (default 1.0).")
-    ap.add_argument("--max-generate-length", type=int, default=2000,
-                    help="Maximum generation steps per chunk (default 2000).")
-    ap.add_argument("--prosody-tail", type=float, default=6.0,
-                    help="Seconds of previous chunk audio to carry forward as "
-                         "ref_audio_latents (default 6.0). Reduce to 4.0 if "
-                         "you hit max_model_len errors.")
-    ap.add_argument("--gpu-memory-utilization", type=float, default=0.90,
-                    help="Fraction of VRAM for nano-vllm (default 0.90).")
-    ap.add_argument("--max-model-len", type=int, default=4096,
-                    help="LM context length (default 4096). Increase + VRAM "
-                         "if you get context overflow errors.")
-    ap.add_argument("--no-control", action="store_true", default=False,
-                    help="Ignore per-chunk control instructions entirely.")
-    ap.add_argument("--simple-control", default=None,
-                    help="Override all per-chunk control instructions with "
-                         "one fixed tag, e.g. 'dry, measured'.")
-    ap.add_argument("--start-at", type=int, default=1,
-                    help="Resume: skip chunks with id < this (1-indexed).")
+    ap.add_argument("--plan", required=True, type=Path)
+    ap.add_argument("--lora", required=True, type=Path)
+    ap.add_argument("--reference", required=True, type=Path)
+    ap.add_argument("--reference-text", default="")
+    ap.add_argument("--reference-text-file", type=Path, default=None)
+    ap.add_argument("--out-dir", required=True, type=Path)
+    ap.add_argument("--cfg", type=float, default=2.0)
+    ap.add_argument("--timesteps", type=int, default=20)
+    ap.add_argument("--temperature", type=float, default=1.0)
+    ap.add_argument("--max-generate-length", type=int, default=2000)
+    ap.add_argument("--prosody-tail", type=float, default=6.0)
+    ap.add_argument("--gpu-memory-utilization", type=float, default=0.90)
+    ap.add_argument("--max-model-len", type=int, default=4096)
+    ap.add_argument("--no-control", action="store_true", default=False)
+    ap.add_argument("--simple-control", default=None)
+    ap.add_argument("--start-at", type=int, default=1)
+
+    # ASR retry gate
+    asr_group = ap.add_argument_group("ASR quality gate (faster-whisper + jiwer)")
+    asr_group.add_argument("--no-asr", action="store_true", default=False,
+                           help="Disable ASR transcription and WER retry entirely.")
+    asr_group.add_argument("--whisper-model", default="base",
+                           help="faster-whisper model size: tiny/base/small/medium/"
+                                "large-v3 (default: base). Use large-v3 for "
+                                "precise QC at the cost of speed.")
+    asr_group.add_argument("--wer-threshold", type=float, default=0.15,
+                           help="WER above which a chunk is retried (default 0.15 "
+                                "= 15%%). Higher = more permissive.")
+    asr_group.add_argument("--max-retries", type=int, default=2,
+                           help="Max regeneration attempts per chunk before "
+                                "keeping the best result (default 2).")
+
     args = ap.parse_args()
 
     # ── validate inputs ────────────────────────────────────────────────────
@@ -280,10 +427,9 @@ def main():
     if not safetensors:
         sys.exit(
             f"No *.safetensors files found in {args.lora}.\n"
-            "nano-vllm-voxcpm requires safetensors format.\n"
-            "Convert your checkpoint:\n"
-            "  python -c \"from safetensors.torch import save_file; import torch; "
-            "save_file(torch.load('lora_weights.pt'), 'lora_weights.safetensors')\""
+            "Convert: python -c \"from safetensors.torch import save_file; "
+            "import torch; save_file(torch.load('lora_weights.pt'), "
+            "'lora_weights.safetensors')\""
         )
 
     plan = json.loads(args.plan.read_text(encoding="utf-8"))
@@ -293,10 +439,17 @@ def main():
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── load model ─────────────────────────────────────────────────────────
+    # ── load ASR model ─────────────────────────────────────────────────────
+    asr_model = None
+    if not args.no_asr:
+        asr_model = _load_asr(args.whisper_model)
+        if asr_model is not None:
+            print(f"[asr] WER threshold={args.wer_threshold * 100:.0f}%  "
+                  f"max-retries={args.max_retries}\n")
+
+    # ── load TTS model ─────────────────────────────────────────────────────
     lora_config = load_lora_config(args.lora)
     print(f"LoRA config loaded from {lora_cfg_file.name}")
-
     print(f"\nLoading {BASE_MODEL} + LoRA ({args.lora.name})...")
     print("(First run will snapshot-download ~9 GB of weights.)\n")
 
@@ -316,23 +469,14 @@ def main():
     sample_rate = int(model_info["sample_rate"])
     print(f"Model ready. Sample rate: {sample_rate} Hz")
 
-    # ── activate the LoRA ──────────────────────────────────────────────────
-    # Init-time lora_config only ALLOCATES slots. The adapter weights must be
-    # registered by path, and lora_name must be passed on every generate()
-    # call to actually apply the adapter. Without this you get the base model.
     LORA_NAME = "voice"
     server.register_lora(LORA_NAME, str(args.lora))
     print(f"LoRA registered and active: '{LORA_NAME}' -> {args.lora}\n")
 
     # ── reference voice prompt ─────────────────────────────────────────────
-    # Clone directly from the reference clip. We register the reference audio
-    # + its transcript as a prompt, then every chunk clones from it via
-    # prompt_id. No intermediate "seed" synthesis — that produced a clone of a
-    # clone, and at low cfg the seed transcript bled into chunk 1.
     print(f"Loading reference clip: {args.reference.name}")
     ref_bytes = wav_to_bytes(args.reference, sample_rate)
 
-    # Resolve the reference transcript: file takes precedence over inline.
     reference_text = args.reference_text
     if args.reference_text_file is not None:
         if not args.reference_text_file.exists():
@@ -342,15 +486,12 @@ def main():
               f"({len(reference_text)} chars)")
 
     if reference_text.strip():
-        # Best path: register reference audio + transcript as a stored prompt.
         prompt_id = server.add_prompt(ref_bytes, "wav", reference_text)
-        ref_latents = None
+        zero_shot_latents = None
         print(f"Reference registered with transcript. prompt_id={prompt_id}\n")
     else:
-        # Zero-shot fallback: no transcript, so we can't use add_prompt
-        # (it requires matching text). Encode latents and pass them per-chunk.
         prompt_id = None
-        ref_latents = server.encode_latents(ref_bytes, "wav")
+        zero_shot_latents = server.encode_latents(ref_bytes, "wav")
         print("No reference transcript given — zero-shot cloning from audio.\n")
 
     # ── generate chunks ────────────────────────────────────────────────────
@@ -373,6 +514,8 @@ def main():
     t_start = time.time()
     n_done = 0
     total_audio_s = 0.0
+    total_retries = 0
+    wer_log = []  # (chunk_id, wer, attempts)
 
     for c in chunks:
         cid = int(c["id"])
@@ -388,11 +531,6 @@ def main():
         wav_name = f"chunk_{cid:04d}.wav"
         wav_path = args.out_dir / wav_name
 
-        # Control tags are NOT applied in this backend: VoxCPM2 via
-        # nano-vllm-voxcpm reads the (instruction)text parenthetical aloud
-        # instead of interpreting it. Inter-chunk continuity is handled by
-        # ref_audio_latents prosody carry-over instead. We still record the
-        # tag in the manifest for reference.
         manifest["items"].append({
             "id": cid,
             "file": wav_name,
@@ -409,29 +547,23 @@ def main():
               f"{text[:55]}{'...' if len(text) > 55 else ''}")
 
         t_chunk = time.time()
-        if prompt_id is not None:
-            gen = server.generate(
-                target_text=text,
-                prompt_id=prompt_id,
-                ref_audio_latents=prev_ref_latents,
-                cfg_value=args.cfg,
-                temperature=args.temperature,
-                max_generate_length=args.max_generate_length,
-                lora_name=LORA_NAME,
-            )
-        else:
-            # Zero-shot: use the reference latents as the prosody/voice ref on
-            # every chunk (no stored prompt available without a transcript).
-            gen = server.generate(
-                target_text=text,
-                ref_audio_latents=prev_ref_latents or ref_latents,
-                cfg_value=args.cfg,
-                temperature=args.temperature,
-                max_generate_length=args.max_generate_length,
-                lora_name=LORA_NAME,
-            )
-        wav = collect_chunks(gen)
-        wav = trim_silence(wav, sample_rate)
+
+        wav, chunk_wer, attempts = generate_with_retry(
+            server=server,
+            text=text,
+            prompt_id=prompt_id,
+            ref_latents=prev_ref_latents,
+            zero_shot_latents=zero_shot_latents,
+            cfg=args.cfg,
+            temperature=args.temperature,
+            max_generate_length=args.max_generate_length,
+            lora_name=LORA_NAME,
+            asr_model=asr_model,
+            wer_threshold=args.wer_threshold,
+            max_retries=args.max_retries,
+            sample_rate=sample_rate,
+        )
+
         sf.write(wav_path, wav, sample_rate, subtype="PCM_16")
 
         # Progress stats.
@@ -439,6 +571,10 @@ def main():
         chunk_audio_s = len(wav) / sample_rate
         total_audio_s += chunk_audio_s
         n_done += 1
+        retries_this_chunk = attempts - 1
+        total_retries += retries_this_chunk
+        wer_log.append((cid, chunk_wer, attempts))
+
         elapsed = time.time() - t_start
         avg_s_per_chunk = elapsed / n_done
         remaining = n_to_generate - n_done
@@ -446,10 +582,15 @@ def main():
         rtf = chunk_wall / chunk_audio_s if chunk_audio_s > 0 else 0.0
         eta_str = (f"{int(eta_s // 60)}m{int(eta_s % 60):02d}s"
                    if eta_s >= 60 else f"{int(eta_s)}s")
-        print(f"         audio={chunk_audio_s:.1f}s wall={chunk_wall:.1f}s "
-              f"RTF={rtf:.2f} ETA={eta_str}")
 
-        # Encode the tail of this chunk for prosody carry-over to the next.
+        wer_str = (f" WER={chunk_wer * 100:.1f}%"
+                   if chunk_wer >= 0 else "")
+        retry_str = (f" retries={retries_this_chunk}"
+                     if retries_this_chunk > 0 else "")
+        print(f"         audio={chunk_audio_s:.1f}s wall={chunk_wall:.1f}s "
+              f"RTF={rtf:.2f}{wer_str}{retry_str} ETA={eta_str}")
+
+        # Encode tail for prosody carry-over.
         tail_samples = int(args.prosody_tail * sample_rate)
         tail = wav[-tail_samples:] if wav.size > tail_samples else wav
         prev_ref_latents = server.encode_latents(
@@ -464,9 +605,21 @@ def main():
 
     total_wall = time.time() - t_start
     avg_rtf = total_wall / total_audio_s if total_audio_s > 0 else 0.0
+
     print(f"\nDone. {n_total} chunks | "
           f"{total_audio_s:.1f}s audio | "
           f"wall {total_wall:.1f}s | avg RTF {avg_rtf:.2f}")
+
+    if asr_model is not None and wer_log:
+        valid_wers = [(cid, w, a) for cid, w, a in wer_log if w >= 0]
+        if valid_wers:
+            avg_wer = sum(w for _, w, _ in valid_wers) / len(valid_wers)
+            worst = max(valid_wers, key=lambda x: x[1])
+            print(f"ASR summary: avg WER={avg_wer * 100:.1f}% | "
+                  f"total retries={total_retries} | "
+                  f"worst chunk={worst[0]} ({worst[1] * 100:.1f}% WER, "
+                  f"{worst[2]} attempts)")
+
     print(f"Manifest: {manifest_path}")
     print(f"Next: python 03_stitch.py --run-dir {args.out_dir} "
           f"--output {args.out_dir / 'final.wav'}")
