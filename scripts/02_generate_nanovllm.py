@@ -73,6 +73,7 @@ Requires: nano-vllm-voxcpm, soundfile, torchaudio, faster-whisper, jiwer
 import argparse
 import io
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -229,13 +230,20 @@ def generate_with_retry(
     wer_threshold: float,
     max_retries: int,
     sample_rate: int,
+    wer_reference: str | None = None,
 ) -> tuple[np.ndarray, float, int]:
     """
     Generate audio for one chunk, retrying if WER exceeds threshold.
 
+    `text` is what the model synthesises (may include a (control) parenthetical
+    and inline [tags]). `wer_reference`, if given, is the clean spoken text used
+    for WER scoring — without the parenthetical or non-verbal tags, since the
+    model should not voice those. Falls back to `text` when not provided.
+
     Returns (best_audio, best_wer, attempts_used).
     best_wer is -1.0 if ASR was skipped.
     """
+    wer_target = wer_reference if wer_reference is not None else text
     def _generate_once(ref_audio_latents) -> np.ndarray:
         if prompt_id is not None:
             gen = server.generate(
@@ -246,6 +254,7 @@ def generate_with_retry(
                 temperature=temperature,
                 max_generate_length=max_generate_length,
                 lora_name=lora_name,
+                retry_badcase=True,
             )
         else:
             gen = server.generate(
@@ -255,6 +264,7 @@ def generate_with_retry(
                 temperature=temperature,
                 max_generate_length=max_generate_length,
                 lora_name=lora_name,
+                retry_badcase=True,
             )
         return collect_chunks(gen)
 
@@ -272,7 +282,7 @@ def generate_with_retry(
             return wav, -1.0, attempts
 
         transcript = _transcribe(asr_model, wav, sample_rate)
-        current_wer = _compute_wer(text, transcript)
+        current_wer = _compute_wer(wer_target, transcript)
 
         if best_audio is None or current_wer < best_wer:
             best_audio = wav
@@ -376,6 +386,20 @@ def apply_control(text: str, control: str) -> str:
     return f"({control}){text}" if control else text
 
 
+_LEADING_PAREN_RE = re.compile(r"^\s*\([^)]*\)\s*")
+_TAG_RE = re.compile(r"\[[^\]]+\]")
+
+
+def clean_for_wer(text: str) -> str:
+    """
+    Strip the leading (control) parenthetical and any inline [non-verbal] tags
+    so WER is scored against only the words the model should actually speak.
+    """
+    text = _LEADING_PAREN_RE.sub("", text)
+    text = _TAG_RE.sub(" ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 # ── main ───────────────────────────────────────────────────────────────────
 
 def main():
@@ -387,7 +411,10 @@ def main():
     ap.add_argument("--reference-text", default="")
     ap.add_argument("--reference-text-file", type=Path, default=None)
     ap.add_argument("--out-dir", required=True, type=Path)
-    ap.add_argument("--cfg", type=float, default=2.0)
+    ap.add_argument("--cfg", type=float, default=1.6,
+                    help="Guidance scale (default 1.6 — more stable for long-form "
+                         "narration; raise to 2.0–2.5 for stricter text adherence "
+                         "at the cost of potential buzzing on difficult inputs).")
     ap.add_argument("--timesteps", type=int, default=20)
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--max-generate-length", type=int, default=2000)
@@ -397,6 +424,13 @@ def main():
     ap.add_argument("--no-control", action="store_true", default=False)
     ap.add_argument("--simple-control", default=None)
     ap.add_argument("--start-at", type=int, default=1)
+    ap.add_argument("--controllable", action="store_true", default=False,
+                    help="Use Controllable Cloning instead of Hi-Fi. Drops the "
+                         "reference transcript (timbre via encoded latents only) "
+                         "so the per-chunk (control instruction) parenthetical is "
+                         "honoured by the model. Trades a little voice fidelity "
+                         "for active style/intonation control. Hi-Fi (default) "
+                         "ignores control instructions entirely.")
 
     # ASR retry gate
     asr_group = ap.add_argument_group("ASR quality gate (faster-whisper + jiwer)")
@@ -485,14 +519,22 @@ def main():
         print(f"Reference transcript loaded from {args.reference_text_file.name} "
               f"({len(reference_text)} chars)")
 
+    if args.controllable and reference_text.strip():
+        print("--controllable set: ignoring reference transcript so per-chunk "
+              "control instructions stay active (Controllable Cloning mode).")
+        reference_text = ""
+
     if reference_text.strip():
         prompt_id = server.add_prompt(ref_bytes, "wav", reference_text)
         zero_shot_latents = None
-        print(f"Reference registered with transcript. prompt_id={prompt_id}\n")
+        print(f"Reference registered with transcript. prompt_id={prompt_id} "
+              f"(Hi-Fi mode — control instructions ignored)\n")
     else:
         prompt_id = None
         zero_shot_latents = server.encode_latents(ref_bytes, "wav")
-        print("No reference transcript given — zero-shot cloning from audio.\n")
+        mode = "Controllable Cloning" if args.controllable else "zero-shot"
+        print(f"Timbre via encoded latents ({mode} — control instructions "
+              f"active).\n")
 
     # ── generate chunks ────────────────────────────────────────────────────
     import time
@@ -527,6 +569,15 @@ def main():
         elif args.simple_control is not None:
             control = args.simple_control
 
+        # In Controllable mode the parenthetical is honoured by the model, so
+        # prepend it to the text: "(dry, measured)De renner...". In Hi-Fi mode
+        # the model would just read the parenthetical aloud, so we never inject
+        # it there — the control tag is recorded in the manifest only.
+        if args.controllable and control.strip():
+            target_text = apply_control(text, control)
+        else:
+            target_text = text
+
         gap_after_ms = c.get("gap_after_ms", 300)
         wav_name = f"chunk_{cid:04d}.wav"
         wav_path = args.out_dir / wav_name
@@ -543,14 +594,15 @@ def main():
             continue
 
         ref_carry = "yes" if prev_ref_latents else "no"
-        print(f"[{cid:03d}/{n_total:03d}] ref_carry={ref_carry} | "
+        ctrl_str = f" ctrl='{control}'" if (args.controllable and control.strip()) else ""
+        print(f"[{cid:03d}/{n_total:03d}] ref_carry={ref_carry}{ctrl_str} | "
               f"{text[:55]}{'...' if len(text) > 55 else ''}")
 
         t_chunk = time.time()
 
         wav, chunk_wer, attempts = generate_with_retry(
             server=server,
-            text=text,
+            text=target_text,
             prompt_id=prompt_id,
             ref_latents=prev_ref_latents,
             zero_shot_latents=zero_shot_latents,
@@ -562,6 +614,7 @@ def main():
             wer_threshold=args.wer_threshold,
             max_retries=args.max_retries,
             sample_rate=sample_rate,
+            wer_reference=clean_for_wer(target_text),
         )
 
         sf.write(wav_path, wav, sample_rate, subtype="PCM_16")
