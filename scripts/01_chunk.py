@@ -5,7 +5,7 @@
 An LLM (via Portkey) reads the WHOLE column first, decides the overall delivery
 register, then splits it into "delivery units" — spans spoken as one continuous
 breath. For each chunk it returns:
-  - text:    the chunk, with numbers expanded and hard names respelled phonetically
+  - text:    the chunk, with numbers expanded and (sparingly) non-verbal tags
   - control: a per-chunk style/pace tag, chosen against the whole arc
   - gap_after: "short" (within paragraph) | "long" (between paragraphs) | "none" (last)
 
@@ -204,8 +204,47 @@ geheel.
 Het allerlaatste fragment krijgt altijd een control instruction die
 afsluiting en rust uitdrukt (bv. "slow, dry, settled, heavy").
 Geen uitzonderingen.
+
 ════════════════════════════════════════════════════════
-STAP 5 — NORMALISEER de tekst voor uitspraak
+STAP 5 — NON-VERBALE TAGS (zeer spaarzaam)
+════════════════════════════════════════════════════════
+Je mag — uitsluitend waar de tekst het echt verdient — een non-verbale tag
+inline in de fragmenttekst plaatsen. De TTS-stem zet deze tags om in een
+hoorbaar, niet-talig geluid (een ademhaling, een korte lach, een zucht).
+
+SYNTAX:
+  - Engelstalige tag, tussen rechte haken, kleine letters: [zucht] wordt
+    NIET gebruikt — gebruik de Engelse vorm. Toegestane tags:
+        [sigh]        — een korte, droge zucht
+        [breath]      — een hoorbare ademhaling vóór een nieuwe gedachte
+        [laugh]       — een korte, ingehouden lach (zelden)
+        [exhale]      — een uitademing, berusting
+  - Plaats de tag exact op de positie in de tekst waar het geluid hoort,
+    niet aan het begin van het fragment als een soort label.
+        Goed:  "Hij won. [exhale] Natuurlijk won hij."
+        Fout:  "[sigh] Hij won opnieuw zonder enige tegenstand."
+        (de tweede plaatst de tag mechanisch vooraan; dat klinkt onecht)
+
+IJZEREN REGELS — overtreed deze nooit:
+  1. MAXIMAAL één tag per fragment. Liever geen.
+  2. De meeste fragmenten krijgen GEEN tag. Een hele column met drie of
+     vier tags in totaal is ruim voldoende. Tags zijn een schaars
+     kruidmiddel, geen vaste ingrediënt.
+  3. Gebruik een tag alleen als het non-verbale geluid betekenis draagt:
+     een droge zucht ná een voorspelbare overwinning, een ademhaling vóór
+     een wending. Nooit ter decoratie.
+  4. Stapel nooit tags ([sigh][breath]) en zet nooit twee tags in één zin.
+  5. Bij twijfel: GEEN tag. De ironie zit in de woorden en de timing; het
+     non-verbale geluid is slechts een zeldzame, welbewuste onderstreping.
+  6. Kleine letters, exact zoals hierboven gespeld. Geen varianten als
+     [Sigh], [laughter], [sighs].
+
+Plaats de tags terwijl je STAP 5 (normalisatie) uitvoert, in dezelfde
+fragmenttekst. De tag telt niet mee als "los cijfer" of als naam — het is
+gewoon onderdeel van de uitspreektekst.
+
+════════════════════════════════════════════════════════
+STAP 6 — NORMALISEER de tekst voor uitspraak
 ════════════════════════════════════════════════════════
 Schrijf de tekst van elk fragment uitspreekvriendelijk:
 
@@ -239,7 +278,7 @@ Schrijf de tekst van elk fragment uitspreekvriendelijk:
     "Phoenix Poule" → "Phoenix Poel"
 
 ════════════════════════════════════════════════════════
-STAP 6 — GAP AFTER (ms)
+STAP 7 — GAP AFTER (ms)
 ════════════════════════════════════════════════════════
 De stilte NA dit fragment, in milliseconden. Richtlijnen:
 
@@ -260,7 +299,7 @@ UITVOER — uitsluitend geldige JSON, geen uitleg, geen markdown
     {
       "id": 1,
       "sentences": ["P1S1", "P1S2"],
-      "text": "<genormaliseerde uitspraakvriendelijke tekst>",
+      "text": "<genormaliseerde uitspraakvriendelijke tekst, eventueel met max één non-verbale tag>",
       "position": "opening",
       "control": "<Engelse control instruction voor dit fragment>",
       "gap_after_ms": 300
@@ -327,6 +366,11 @@ def parse_plan(raw: str) -> dict:
     return json.loads(text)
 
 
+# Allowed non-verbal tags. Anything in [brackets] not on this list is a warning.
+ALLOWED_TAGS = {"[sigh]", "[breath]", "[laugh]", "[exhale]"}
+_TAG_RE = re.compile(r"\[[^\]]+\]")
+
+
 def validate_plan(plan: dict, expected_sentence_ids: set[str] | None = None) -> list[str]:
     """Return a list of warnings (empty if clean). Non-fatal sanity checks."""
     warnings = []
@@ -335,9 +379,11 @@ def validate_plan(plan: dict, expected_sentence_ids: set[str] | None = None) -> 
         warnings.append("No chunks returned.")
         return warnings
     valid_positions = {"opening", "continuing", "final"}
+    total_tags = 0
     for i, c in enumerate(chunks):
         cid = c.get("id", i + 1)
-        if not c.get("text", "").strip():
+        text = c.get("text", "")
+        if not text.strip():
             warnings.append(f"Chunk {cid}: empty text.")
         if not c.get("control", "").strip():
             warnings.append(f"Chunk {cid}: missing control tag.")
@@ -350,8 +396,23 @@ def validate_plan(plan: dict, expected_sentence_ids: set[str] | None = None) -> 
         elif gap < 0 or gap > 3000:
             warnings.append(f"Chunk {cid}: gap_after_ms={gap} out of sane "
                             f"range (0-3000).")
+        # Non-verbal tag checks.
+        tags_in_chunk = _TAG_RE.findall(text)
+        if len(tags_in_chunk) > 1:
+            warnings.append(f"Chunk {cid}: {len(tags_in_chunk)} non-verbal tags "
+                            f"in one chunk (max 1): {tags_in_chunk}")
+        for t in tags_in_chunk:
+            if t not in ALLOWED_TAGS:
+                warnings.append(f"Chunk {cid}: unknown non-verbal tag {t!r} "
+                                f"(allowed: {sorted(ALLOWED_TAGS)})")
+        total_tags += len(tags_in_chunk)
     if chunks and chunks[-1].get("gap_after_ms") not in (0, 0.0):
         warnings.append("Last chunk's gap_after_ms should be 0.")
+    # Tags should be rare. Flag if the LLM got tag-happy.
+    if total_tags > max(4, len(chunks) // 8):
+        warnings.append(f"{total_tags} non-verbal tags across {len(chunks)} "
+                        f"chunks — likely too many; tags should be a rare "
+                        f"seasoning. Review and trim.")
     # Flag any digits that survived normalization.
     for c in chunks:
         if any(ch.isdigit() for ch in c.get("text", "")):
