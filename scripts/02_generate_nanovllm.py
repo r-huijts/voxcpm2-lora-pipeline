@@ -171,7 +171,12 @@ def main():
                     help="LoRA checkpoint dir (must contain lora_config.json "
                          "and *.safetensors weights).")
     ap.add_argument("--reference", required=True, type=Path,
-                    help="Reference voice clip (WAV/FLAC/MP3) for the voice seed.")
+                    help="Reference voice clip (WAV/FLAC/MP3) to clone from.")
+    ap.add_argument("--reference-text", default="",
+                    help="Transcript of the reference clip. Strongly "
+                         "recommended — improves cloning quality and prevents "
+                         "the model speaking stray words. Leave empty for "
+                         "zero-shot cloning from audio alone.")
     ap.add_argument("--out-dir", required=True, type=Path,
                     help="Output directory for chunk wavs + manifest.json.")
     ap.add_argument("--cfg", type=float, default=2.0,
@@ -228,8 +233,7 @@ def main():
 
     # ── load model ─────────────────────────────────────────────────────────
     lora_config = load_lora_config(args.lora)
-    print(f"LoRA config: rank={getattr(lora_config, 'r', '?')}, "
-          f"from {lora_cfg_file.name}")
+    print(f"LoRA config loaded from {lora_cfg_file.name}")
 
     print(f"\nLoading {BASE_MODEL} + LoRA ({args.lora.name})...")
     print("(First run will snapshot-download ~9 GB of weights.)\n")
@@ -241,47 +245,42 @@ def main():
         max_num_seqs=16,
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
-        enforce_eager=False,
+        enforce_eager=True,
         devices=[0],
         lora_config=lora_config,
     )
 
     model_info = server.get_model_info()
     sample_rate = int(model_info["sample_rate"])
-    print(f"Model ready. Sample rate: {sample_rate} Hz\n")
+    print(f"Model ready. Sample rate: {sample_rate} Hz")
 
-    # ── voice seed ─────────────────────────────────────────────────────────
-    # 1. Load reference clip and resample to model rate.
+    # ── activate the LoRA ──────────────────────────────────────────────────
+    # Init-time lora_config only ALLOCATES slots. The adapter weights must be
+    # registered by path, and lora_name must be passed on every generate()
+    # call to actually apply the adapter. Without this you get the base model.
+    LORA_NAME = "voice"
+    server.register_lora(LORA_NAME, str(args.lora))
+    print(f"LoRA registered and active: '{LORA_NAME}' -> {args.lora}\n")
+
+    # ── reference voice prompt ─────────────────────────────────────────────
+    # Clone directly from the reference clip. We register the reference audio
+    # + its transcript as a prompt, then every chunk clones from it via
+    # prompt_id. No intermediate "seed" synthesis — that produced a clone of a
+    # clone, and at low cfg the seed transcript bled into chunk 1.
     print(f"Loading reference clip: {args.reference.name}")
     ref_bytes = wav_to_bytes(args.reference, sample_rate)
 
-    # 2. Encode the reference audio into latent vectors.
-    #    prompt_latents must be pre-encoded float32 latents, not raw WAV bytes.
-    print("Encoding reference clip to latents...")
-    ref_latents = server.encode_latents(ref_bytes, "wav")
-
-    # 3. Synthesise a short neutral Dutch seed conditioned on the reference
-    #    latents, so the registered anchor captures the cloned timbre.
-    #    The seed absorbs model warm-up instability — chunk 1 starts clean.
-    print(f"Synthesising voice seed ({len(SEED_TEXT)} chars)...")
-    seed_controlled = apply_control(SEED_TEXT, "measured, dry, neutral")
-    seed_wav = collect_chunks(
-        server.generate(
-            target_text=seed_controlled,
-            prompt_latents=ref_latents,
-            prompt_text=SEED_TEXT,
-            cfg_value=args.cfg,
-            temperature=args.temperature,
-            max_generate_length=args.max_generate_length,
-        )
-    )
-    seed_wav = trim_silence(seed_wav, sample_rate)
-    sf.write(args.out_dir / "_seed.wav", seed_wav, sample_rate, subtype="PCM_16")
-
-    # 4. Register the seed audio as the permanent voice anchor.
-    seed_bytes = ndarray_to_wav_bytes(seed_wav, sample_rate)
-    prompt_id = server.add_prompt(seed_bytes, "wav", SEED_TEXT)
-    print(f"Voice seed registered. prompt_id={prompt_id}\n")
+    if args.reference_text.strip():
+        # Best path: register reference audio + transcript as a stored prompt.
+        prompt_id = server.add_prompt(ref_bytes, "wav", args.reference_text)
+        ref_latents = None
+        print(f"Reference registered with transcript. prompt_id={prompt_id}\n")
+    else:
+        # Zero-shot fallback: no transcript, so we can't use add_prompt
+        # (it requires matching text). Encode latents and pass them per-chunk.
+        prompt_id = None
+        ref_latents = server.encode_latents(ref_bytes, "wav")
+        print("No reference transcript given — zero-shot cloning from audio.\n")
 
     # ── generate chunks ────────────────────────────────────────────────────
     import time
@@ -318,6 +317,11 @@ def main():
         wav_name = f"chunk_{cid:04d}.wav"
         wav_path = args.out_dir / wav_name
 
+        # Control tags are NOT applied in this backend: VoxCPM2 via
+        # nano-vllm-voxcpm reads the (instruction)text parenthetical aloud
+        # instead of interpreting it. Inter-chunk continuity is handled by
+        # ref_audio_latents prosody carry-over instead. We still record the
+        # tag in the manifest for reference.
         manifest["items"].append({
             "id": cid,
             "file": wav_name,
@@ -329,22 +333,33 @@ def main():
             print(f"[{cid:03d}/{n_total:03d}] skipped (resume)")
             continue
 
-        controlled = apply_control(text, control)
         ref_carry = "yes" if prev_ref_latents else "no"
         print(f"[{cid:03d}/{n_total:03d}] ref_carry={ref_carry} | "
               f"{text[:55]}{'...' if len(text) > 55 else ''}")
 
         t_chunk = time.time()
-        wav = collect_chunks(
-            server.generate(
-                target_text=controlled,
+        if prompt_id is not None:
+            gen = server.generate(
+                target_text=text,
                 prompt_id=prompt_id,
                 ref_audio_latents=prev_ref_latents,
                 cfg_value=args.cfg,
                 temperature=args.temperature,
                 max_generate_length=args.max_generate_length,
+                lora_name=LORA_NAME,
             )
-        )
+        else:
+            # Zero-shot: use the reference latents as the prosody/voice ref on
+            # every chunk (no stored prompt available without a transcript).
+            gen = server.generate(
+                target_text=text,
+                ref_audio_latents=prev_ref_latents or ref_latents,
+                cfg_value=args.cfg,
+                temperature=args.temperature,
+                max_generate_length=args.max_generate_length,
+                lora_name=LORA_NAME,
+            )
+        wav = collect_chunks(gen)
         wav = trim_silence(wav, sample_rate)
         sf.write(wav_path, wav, sample_rate, subtype="PCM_16")
 
