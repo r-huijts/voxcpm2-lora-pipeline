@@ -81,9 +81,22 @@ def load_lora_config(lora_path: Path) -> LoRAConfig:
     if not cfg_file.exists():
         sys.exit(f"No lora_config.json found in {lora_path}")
     data = json.loads(cfg_file.read_text(encoding="utf-8"))
-    # The training pipeline wraps config under "lora_config" key; handle both.
     cfg = data.get("lora_config", data)
-    return LoRAConfig(**cfg)
+
+    # Map training checkpoint fields to nano-vllm-voxcpm's LoRAConfig schema.
+    # The training pipeline uses r/alpha/dropout; the inference engine uses
+    # max_lora_rank/max_loras and drops alpha and dropout entirely.
+    mapped = {
+        "enable_lm":           cfg.get("enable_lm", True),
+        "enable_dit":          cfg.get("enable_dit", True),
+        "enable_proj":         cfg.get("enable_proj", False),
+        "max_lora_rank":       cfg.get("r", 32),
+        "max_loras":           1,
+        "target_modules_lm":   cfg.get("target_modules_lm", ["q_proj", "k_proj", "v_proj", "o_proj"]),
+        "target_modules_dit":  cfg.get("target_modules_dit", ["q_proj", "k_proj", "v_proj", "o_proj"]),
+        "target_proj_modules": cfg.get("target_proj_modules", []),
+    }
+    return LoRAConfig(**mapped)
 
 
 def wav_to_bytes(path: Path, target_sr: int) -> bytes:
