@@ -620,6 +620,23 @@ def main():
                   f"worst chunk={worst[0]} ({worst[1] * 100:.1f}% WER, "
                   f"{worst[2]} attempts)")
 
+            wer_log_path = args.out_dir / "wer_log.json"
+            wer_log_data = {
+                "avg_wer": round(avg_wer, 4),
+                "total_retries": total_retries,
+                "threshold": args.wer_threshold,
+                "whisper_model": args.whisper_model,
+                "chunks": [
+                    {"id": cid, "wer": round(w, 4), "attempts": a}
+                    for cid, w, a in valid_wers
+                ],
+            }
+            wer_log_path.write_text(
+                json.dumps(wer_log_data, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            print(f"WER log:  {wer_log_path}")
+
     print(f"Manifest: {manifest_path}")
     print(f"Next: python 03_stitch.py --run-dir {args.out_dir} "
           f"--output {args.out_dir / 'final.wav'}")
