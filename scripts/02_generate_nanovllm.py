@@ -57,6 +57,65 @@ import soundfile as sf
 import torchaudio
 import torch
 
+
+def _ensure_nanovllm_patched() -> None:
+    """
+    Re-apply the two nano-vllm-voxcpm source fixes required for single-sequence
+    LoRA inference, in case the package was reinstalled and reverted to stock.
+    Idempotent and silent when already patched. Must run BEFORE importing
+    nanovllm_voxcpm so the corrected kernel source is what gets imported.
+
+    Fix 1 (lora_shrink_op.py): _SMALL_M_THRESHOLD 32 -> 0. The small-m LoRA
+           kernel's 1xK tl.dot violates Triton's M>=16 rule at batch < 16;
+           disabling that path routes to the regular kernel, which works.
+    Fix 2 (model_runner.py): guard self.graphs access with getattr so eager
+           mode (enforce_eager=True) doesn't AttributeError before the
+           enforce_eager short-circuit.
+
+    See patch_nanovllm.py for the standalone version + backups + --revert.
+    """
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec("nanovllm_voxcpm")
+        if spec is None or not spec.submodule_search_locations:
+            return  # not installed; the real import below will raise clearly
+        root = Path(list(spec.submodule_search_locations)[0])
+    except Exception:
+        return
+
+    edits = [
+        (
+            root / "lora_ops" / "triton_ops" / "lora_shrink_op.py",
+            "_SMALL_M_THRESHOLD = 32",
+            "_SMALL_M_THRESHOLD = 0",
+        ),
+        (
+            root / "engine" / "model_runner.py",
+            'has_lora_graph = has_active_lora and bool(self.graphs.get("lora"))',
+            'has_lora_graph = has_active_lora and bool(getattr(self, "graphs", {}).get("lora"))',
+        ),
+    ]
+
+    for path, old, new in edits:
+        try:
+            if not path.exists():
+                continue
+            text = path.read_text(encoding="utf-8")
+            if new in text:
+                continue  # already patched
+            if old in text:
+                backup = path.with_suffix(path.suffix + ".orig")
+                if not backup.exists():
+                    backup.write_text(text, encoding="utf-8")
+                path.write_text(text.replace(old, new), encoding="utf-8")
+                print(f"[self-patch] applied fix to {path.name}")
+        except Exception as e:
+            print(f"[self-patch] WARNING: could not patch {path.name}: {e}",
+                  file=sys.stderr)
+
+
+_ensure_nanovllm_patched()
+
 from nanovllm_voxcpm import VoxCPM
 from nanovllm_voxcpm.models.voxcpm.config import LoRAConfig
 
