@@ -176,7 +176,7 @@ def main():
                     help="Output directory for chunk wavs + manifest.json.")
     ap.add_argument("--cfg", type=float, default=2.0,
                     help="cfg_value / guidance scale (default 2.0).")
-    ap.add_argument("--timesteps", type=int, default=30,
+    ap.add_argument("--timesteps", type=int, default=20,
                     help="inference_timesteps (default 30; no speed pressure "
                          "so use 30 for quality).")
     ap.add_argument("--temperature", type=float, default=1.0,
@@ -241,7 +241,7 @@ def main():
         max_num_seqs=16,
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
-        enforce_eager=True,
+        enforce_eager=False,
         devices=[0],
         lora_config=lora_config,
     )
@@ -284,7 +284,11 @@ def main():
     print(f"Voice seed registered. prompt_id={prompt_id}\n")
 
     # ── generate chunks ────────────────────────────────────────────────────
-    print(f"Generating {len(chunks)} chunks "
+    import time
+
+    n_total = len(chunks)
+    n_to_generate = sum(1 for c in chunks if int(c["id"]) >= args.start_at)
+    print(f"Generating {n_total} chunks "
           f"(cfg={args.cfg}, timesteps={args.timesteps}, "
           f"temperature={args.temperature}, "
           f"prosody_tail={args.prosody_tail}s)...\n")
@@ -296,6 +300,9 @@ def main():
     }
 
     prev_ref_latents: bytes | None = None
+    t_start = time.time()
+    n_done = 0
+    total_audio_s = 0.0
 
     for c in chunks:
         cid = int(c["id"])
@@ -319,14 +326,15 @@ def main():
         })
 
         if cid < args.start_at:
-            print(f"[{cid:03d}] skipped (resume)")
+            print(f"[{cid:03d}/{n_total:03d}] skipped (resume)")
             continue
 
         controlled = apply_control(text, control)
         ref_carry = "yes" if prev_ref_latents else "no"
-        print(f"[{cid:03d}] ref_carry={ref_carry} | ({control or 'no control'}) "
-              f"{text[:60]}{'...' if len(text) > 60 else ''}")
+        print(f"[{cid:03d}/{n_total:03d}] ref_carry={ref_carry} | "
+              f"{text[:55]}{'...' if len(text) > 55 else ''}")
 
+        t_chunk = time.time()
         wav = collect_chunks(
             server.generate(
                 target_text=controlled,
@@ -339,6 +347,21 @@ def main():
         )
         wav = trim_silence(wav, sample_rate)
         sf.write(wav_path, wav, sample_rate, subtype="PCM_16")
+
+        # Progress stats.
+        chunk_wall = time.time() - t_chunk
+        chunk_audio_s = len(wav) / sample_rate
+        total_audio_s += chunk_audio_s
+        n_done += 1
+        elapsed = time.time() - t_start
+        avg_s_per_chunk = elapsed / n_done
+        remaining = n_to_generate - n_done
+        eta_s = avg_s_per_chunk * remaining
+        rtf = chunk_wall / chunk_audio_s if chunk_audio_s > 0 else 0.0
+        eta_str = (f"{int(eta_s // 60)}m{int(eta_s % 60):02d}s"
+                   if eta_s >= 60 else f"{int(eta_s)}s")
+        print(f"         audio={chunk_audio_s:.1f}s wall={chunk_wall:.1f}s "
+              f"RTF={rtf:.2f} ETA={eta_str}")
 
         # Encode the tail of this chunk for prosody carry-over to the next.
         tail_samples = int(args.prosody_tail * sample_rate)
@@ -353,8 +376,11 @@ def main():
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
-    n = len(chunks)
-    print(f"\nDone. {n} chunks in {args.out_dir}")
+    total_wall = time.time() - t_start
+    avg_rtf = total_wall / total_audio_s if total_audio_s > 0 else 0.0
+    print(f"\nDone. {n_total} chunks | "
+          f"{total_audio_s:.1f}s audio | "
+          f"wall {total_wall:.1f}s | avg RTF {avg_rtf:.2f}")
     print(f"Manifest: {manifest_path}")
     print(f"Next: python 03_stitch.py --run-dir {args.out_dir} "
           f"--output {args.out_dir / 'final.wav'}")
