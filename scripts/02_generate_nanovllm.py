@@ -81,22 +81,9 @@ def load_lora_config(lora_path: Path) -> LoRAConfig:
     if not cfg_file.exists():
         sys.exit(f"No lora_config.json found in {lora_path}")
     data = json.loads(cfg_file.read_text(encoding="utf-8"))
+    # The training pipeline wraps config under "lora_config" key; handle both.
     cfg = data.get("lora_config", data)
-
-    # Map training checkpoint fields to nano-vllm-voxcpm's LoRAConfig schema.
-    # The training pipeline uses r/alpha/dropout; the inference engine uses
-    # max_lora_rank/max_loras and drops alpha and dropout entirely.
-    mapped = {
-        "enable_lm":           cfg.get("enable_lm", True),
-        "enable_dit":          cfg.get("enable_dit", True),
-        "enable_proj":         cfg.get("enable_proj", False),
-        "max_lora_rank":       cfg.get("r", 32),
-        "max_loras":           1,
-        "target_modules_lm":   cfg.get("target_modules_lm", ["q_proj", "k_proj", "v_proj", "o_proj"]),
-        "target_modules_dit":  cfg.get("target_modules_dit", ["q_proj", "k_proj", "v_proj", "o_proj"]),
-        "target_proj_modules": cfg.get("target_proj_modules", []),
-    }
-    return LoRAConfig(**mapped)
+    return LoRAConfig(**cfg)
 
 
 def wav_to_bytes(path: Path, target_sr: int) -> bytes:
@@ -239,7 +226,7 @@ def main():
         max_num_seqs=16,
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
-        enforce_eager=True,
+        enforce_eager=False,
         devices=[0],
         lora_config=lora_config,
     )
@@ -253,15 +240,20 @@ def main():
     print(f"Loading reference clip: {args.reference.name}")
     ref_bytes = wav_to_bytes(args.reference, sample_rate)
 
-    # 2. Synthesise a short neutral Dutch seed using the reference as the
-    #    prompt, so the registered anchor captures the cloned timbre.
+    # 2. Encode the reference audio into latent vectors.
+    #    prompt_latents must be pre-encoded float32 latents, not raw WAV bytes.
+    print("Encoding reference clip to latents...")
+    ref_latents = server.encode_latents(ref_bytes, "wav")
+
+    # 3. Synthesise a short neutral Dutch seed conditioned on the reference
+    #    latents, so the registered anchor captures the cloned timbre.
     #    The seed absorbs model warm-up instability — chunk 1 starts clean.
     print(f"Synthesising voice seed ({len(SEED_TEXT)} chars)...")
     seed_controlled = apply_control(SEED_TEXT, "measured, dry, neutral")
     seed_wav = collect_chunks(
         server.generate(
             target_text=seed_controlled,
-            prompt_latents=ref_bytes,
+            prompt_latents=ref_latents,
             prompt_text=SEED_TEXT,
             cfg_value=args.cfg,
             temperature=args.temperature,
@@ -271,7 +263,7 @@ def main():
     seed_wav = trim_silence(seed_wav, sample_rate)
     sf.write(args.out_dir / "_seed.wav", seed_wav, sample_rate, subtype="PCM_16")
 
-    # 3. Register the seed audio as the permanent voice anchor.
+    # 4. Register the seed audio as the permanent voice anchor.
     seed_bytes = ndarray_to_wav_bytes(seed_wav, sample_rate)
     prompt_id = server.add_prompt(seed_bytes, "wav", SEED_TEXT)
     print(f"Voice seed registered. prompt_id={prompt_id}\n")
