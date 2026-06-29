@@ -173,10 +173,13 @@ def main():
     ap.add_argument("--reference", required=True, type=Path,
                     help="Reference voice clip (WAV/FLAC/MP3) to clone from.")
     ap.add_argument("--reference-text", default="",
-                    help="Transcript of the reference clip. Strongly "
+                    help="Transcript of the reference clip (inline). Strongly "
                          "recommended — improves cloning quality and prevents "
                          "the model speaking stray words. Leave empty for "
                          "zero-shot cloning from audio alone.")
+    ap.add_argument("--reference-text-file", type=Path, default=None,
+                    help="Path to a .txt file containing the reference "
+                         "transcript. Takes precedence over --reference-text.")
     ap.add_argument("--out-dir", required=True, type=Path,
                     help="Output directory for chunk wavs + manifest.json.")
     ap.add_argument("--cfg", type=float, default=2.0,
@@ -270,9 +273,18 @@ def main():
     print(f"Loading reference clip: {args.reference.name}")
     ref_bytes = wav_to_bytes(args.reference, sample_rate)
 
-    if args.reference_text.strip():
+    # Resolve the reference transcript: file takes precedence over inline.
+    reference_text = args.reference_text
+    if args.reference_text_file is not None:
+        if not args.reference_text_file.exists():
+            sys.exit(f"Reference text file not found: {args.reference_text_file}")
+        reference_text = args.reference_text_file.read_text(encoding="utf-8").strip()
+        print(f"Reference transcript loaded from {args.reference_text_file.name} "
+              f"({len(reference_text)} chars)")
+
+    if reference_text.strip():
         # Best path: register reference audio + transcript as a stored prompt.
-        prompt_id = server.add_prompt(ref_bytes, "wav", args.reference_text)
+        prompt_id = server.add_prompt(ref_bytes, "wav", reference_text)
         ref_latents = None
         print(f"Reference registered with transcript. prompt_id={prompt_id}\n")
     else:
