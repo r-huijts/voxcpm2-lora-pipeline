@@ -239,7 +239,7 @@ def main():
         max_num_seqs=16,
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
-        enforce_eager=False,
+        enforce_eager=True,
         devices=[0],
         lora_config=lora_config,
     )
