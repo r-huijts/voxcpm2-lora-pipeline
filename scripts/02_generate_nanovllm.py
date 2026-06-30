@@ -417,6 +417,29 @@ def clean_for_wer(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def concat_latents(*blobs: bytes | None, feat_dim: int) -> bytes | None:
+    """
+    Concatenate one or more raw-float32 latent blobs (as returned by
+    server.encode_latents) into a single blob, in order. None blobs are
+    skipped. Used for regrounding: original reference latents + previous-chunk
+    tail latents share the one ref_audio_latents slot, so the model sees the
+    true voice anchor AND the prosody carry-over on the same chunk.
+
+    Each blob is float32 of shape (frames * feat_dim,) where frames is a
+    multiple of patch_size; vertical concatenation preserves that invariant.
+    """
+    parts = []
+    for b in blobs:
+        if b is None:
+            continue
+        arr = np.frombuffer(b, dtype=np.float32).reshape(-1, feat_dim)
+        if arr.shape[0]:
+            parts.append(arr)
+    if not parts:
+        return None
+    return np.concatenate(parts, axis=0).astype(np.float32).tobytes()
+
+
 # ── main ───────────────────────────────────────────────────────────────────
 
 def main():
@@ -448,6 +471,21 @@ def main():
                          "honoured by the model. Trades a little voice fidelity "
                          "for active style/intonation control. Hi-Fi (default) "
                          "ignores control instructions entirely.")
+    ap.add_argument("--reground", default="every",
+                    help="Controllable mode only. How often to re-anchor the "
+                         "ORIGINAL reference voice into the ref_audio_latents slot "
+                         "to stop timbre drift. 'every' (default) = every chunk "
+                         "sees [original reference + previous-chunk tail], the most "
+                         "stable option. An integer N = hard reground to the pure "
+                         "original reference every N chunks, plain carry-over in "
+                         "between. '0' or 'off' = never reground (pure carry-over; "
+                         "the old drifting behaviour).")
+    ap.add_argument("--reground-anchor-frames", type=int, default=200,
+                    help="Cap on the original-reference anchor length in latent "
+                         "frames when regrounding (default 200, ~a few seconds). "
+                         "Protects max_model_len when anchor + tail + a long chunk "
+                         "combine. Set 0 to disable the cap and use the full "
+                         "reference.")
 
     # ASR retry gate
     asr_group = ap.add_argument_group("ASR quality gate (faster-whisper + jiwer)")
@@ -553,6 +591,61 @@ def main():
         print(f"Timbre via encoded latents ({mode} — control instructions "
               f"active).\n")
 
+    # ── regrounding setup (Controllable mode only) ─────────────────────────
+    # The original reference latents anchor timbre; in Controllable mode they
+    # share the single ref_audio_latents slot with the prosody carry-over.
+    # Without regrounding the slot holds only the previous chunk's tail, so the
+    # voice clones a clone and drifts. We re-inject the original reference here.
+    ref_anchor_latents = zero_shot_latents  # original reference (bytes) or None
+    try:
+        feat_dim = int(server.llm.feat_dim)
+    except Exception:
+        feat_dim = None
+
+    # Cap the regrounding anchor so [anchor + tail + long chunk] can't overflow
+    # max_model_len. The reference clip is usually short, but a hard cap is
+    # cheap insurance. Trim to the FIRST anchor_cap_frames latent frames
+    # (a multiple of patch_size).
+    if (args.controllable and ref_anchor_latents is not None
+            and feat_dim is not None and args.reground_anchor_frames > 0):
+        try:
+            arr = np.frombuffer(ref_anchor_latents, dtype=np.float32).reshape(-1, feat_dim)
+            cap = args.reground_anchor_frames
+            if arr.shape[0] > cap:
+                ref_anchor_latents = arr[:cap].astype(np.float32).tobytes()
+                print(f"Reground anchor trimmed to first {cap} latent frames "
+                      f"(was {arr.shape[0]}).")
+        except Exception as e:
+            print(f"WARNING: could not trim reground anchor: {e}")
+
+    # Parse --reground into a mode: "every" | "off" | int N.
+    reground_raw = str(args.reground).strip().lower()
+    if reground_raw in ("off", "none", "0"):
+        reground_mode, reground_n = "off", 0
+    elif reground_raw == "every":
+        reground_mode, reground_n = "every", 1
+    else:
+        try:
+            reground_n = int(reground_raw)
+            reground_mode = "n" if reground_n > 0 else "off"
+        except ValueError:
+            sys.exit(f"--reground must be 'every', 'off', or an integer; "
+                     f"got {args.reground!r}")
+
+    if args.controllable and ref_anchor_latents is not None:
+        if feat_dim is None:
+            print("WARNING: could not read feat_dim from server; regrounding "
+                  "disabled (falling back to pure carry-over).")
+            reground_mode = "off"
+        elif reground_mode == "every":
+            print("Regrounding: ORIGINAL reference re-anchored on EVERY chunk "
+                  "(reference + carry-over tail share the ref slot).\n")
+        elif reground_mode == "n":
+            print(f"Regrounding: hard reset to ORIGINAL reference every "
+                  f"{reground_n} chunks; pure carry-over in between.\n")
+        else:
+            print("Regrounding: OFF (pure carry-over — timbre may drift).\n")
+
     # ── generate chunks ────────────────────────────────────────────────────
     import time
 
@@ -566,6 +659,9 @@ def main():
     manifest = {
         "config": plan.get("config", {}),
         "register": plan.get("register"),
+        "mode": ("controllable" if args.controllable else "hifi"),
+        "reground": (reground_mode if args.controllable else None),
+        "cfg": args.cfg,
         "items": [],
     }
 
@@ -612,7 +708,30 @@ def main():
 
         ref_carry = "yes" if prev_ref_latents else "no"
         ctrl_str = f" ctrl='{control}'" if (args.controllable and control.strip()) else ""
-        print(f"[{cid:03d}/{n_total:03d}] ref_carry={ref_carry}{ctrl_str} | "
+
+        # ── decide what goes in the ref_audio_latents slot ─────────────────
+        # Hi-Fi: timbre comes from prompt_id, so the slot is pure prosody
+        #   carry-over (previous tail), unchanged from before.
+        # Controllable: the slot is the ONLY voice anchor, so we reground the
+        #   original reference into it according to --reground.
+        reground_tag = ""
+        if not args.controllable or ref_anchor_latents is None or reground_mode == "off":
+            chunk_ref_latents = prev_ref_latents
+        elif reground_mode == "every":
+            # Original reference + previous tail, every chunk. True anchor +
+            # prosody continuity in one slot.
+            chunk_ref_latents = concat_latents(
+                ref_anchor_latents, prev_ref_latents, feat_dim=feat_dim
+            )
+            reground_tag = " reground=ref+tail"
+        else:  # mode == "n": hard reset every N chunks
+            if (n_done % reground_n) == 0 or prev_ref_latents is None:
+                chunk_ref_latents = ref_anchor_latents
+                reground_tag = " reground=hard"
+            else:
+                chunk_ref_latents = prev_ref_latents
+
+        print(f"[{cid:03d}/{n_total:03d}] ref_carry={ref_carry}{ctrl_str}{reground_tag} | "
               f"{text[:55]}{'...' if len(text) > 55 else ''}")
 
         t_chunk = time.time()
@@ -621,7 +740,7 @@ def main():
             server=server,
             text=target_text,
             prompt_id=prompt_id,
-            ref_latents=prev_ref_latents,
+            ref_latents=chunk_ref_latents,
             zero_shot_latents=zero_shot_latents,
             cfg=args.cfg,
             temperature=args.temperature,
