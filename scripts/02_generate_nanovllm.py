@@ -254,7 +254,6 @@ def generate_with_retry(
                 temperature=temperature,
                 max_generate_length=max_generate_length,
                 lora_name=lora_name,
-                retry_badcase=True,
             )
         else:
             gen = server.generate(
@@ -264,7 +263,6 @@ def generate_with_retry(
                 temperature=temperature,
                 max_generate_length=max_generate_length,
                 lora_name=lora_name,
-                retry_badcase=True,
             )
         return collect_chunks(gen)
 
