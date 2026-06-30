@@ -5,7 +5,11 @@ portkey-ai>=1.0.0        # LLM gateway client
 pysbd>=0.3.4             # deterministic Dutch sentence segmentation
 
 # Stage 2 — generate
-# voxcpm + torch + soundfile come from the main repo / upstream VoxCPM install
+# voxcpm + torch come from the main repo / upstream VoxCPM install
+nano-vllm-voxcpm         # vllm-style serving backend with LoRA + prosody carry-over
+torchaudio               # reference-clip load/resample to model sample rate
+faster-whisper>=1.0.0    # ASR for the per-chunk WER quality gate (CTranslate2 Whisper)
+jiwer>=3.0.0             # Word Error Rate computation (Dutch-normalized) for retry loop
 
 # Stage 3 — stitch
 numpy>=1.24
@@ -14,3 +18,7 @@ pyloudnorm>=0.1.1        # EBU R128 / ITU-R BS.1770 loudness normalization
 
 # ffmpeg (system binary) is used for reference-clip conversion in Stage 2
 # and is optional for the post-hoc atempo slow-down.
+#
+# faster-whisper on CUDA needs cuDNN 9 libraries present; these usually come
+# with the torch CUDA install. If you hit a libcudnn load error at ASR startup,
+# that is the cause.

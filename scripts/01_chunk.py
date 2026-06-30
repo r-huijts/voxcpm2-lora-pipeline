@@ -280,15 +280,25 @@ Schrijf de tekst van elk fragment uitspreekvriendelijk:
 ════════════════════════════════════════════════════════
 STAP 7 — GAP AFTER (ms)
 ════════════════════════════════════════════════════════
-De stilte NA dit fragment, in milliseconden. Richtlijnen:
+De stilte NA dit fragment, in milliseconden.
 
-  "continuing", gedachte loopt direct door  :   0 –  150 ms
-  Gewone grens binnen een gedachte          : 200 –  350 ms
-  Einde van een gedachte / alinea-grens     : 450 –  700 ms
-  Dramatische beat vóór een clou of reveal  : 600 –  900 ms
+Wees aan de royale kant met deze pauzes. Deze stem levert droog, bedachtzaam
+wielercommentaar; de ironie en het gewicht zitten in de timing. Lucht tussen
+delivery units laat een zin landen voordat de volgende begint. Liever iets te
+veel ruimte dan een gehaaste, opeengepakte voordracht. Bij twijfel: kies de
+langere pauze.
+
+Richtlijnen (royaal bemeten):
+
+  "continuing", gedachte loopt direct door  : 100 –  250 ms
+  Gewone grens binnen een gedachte          : 350 –  550 ms
+  Einde van een gedachte / alinea-grens     : 650 –  950 ms
+  Dramatische beat vóór een clou of reveal  : 850 – 1200 ms
   Allerlaatste fragment                     : altijd 0
 
-Kies een concreet getal. Ronde getallen zijn prima.
+Kies een concreet getal. Ronde getallen zijn prima. De globale gap_scale-knop
+kan alles achteraf nog proportioneel bijregelen, dus mik hier op de natuurlijke
+voordracht en niet op een totale tijdsduur.
 
 ════════════════════════════════════════════════════════
 UITVOER — uitsluitend geldige JSON, geen uitleg, geen markdown
