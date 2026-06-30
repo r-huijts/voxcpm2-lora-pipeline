@@ -73,9 +73,22 @@ Requires: nano-vllm-voxcpm, soundfile, torchaudio, faster-whisper, jiwer
 import argparse
 import io
 import json
+import os
 import re
 import sys
+import warnings
 from pathlib import Path
+
+# ── silence harmless third-party noise ─────────────────────────────────────
+# torch weight_norm deprecation, torchaudio TorchCodec-migration warnings, and
+# the nano-vllm "non-writable NumPy array" UserWarning are all cosmetic and do
+# not affect output. Suppress them so the generation log stays readable. Set
+# VOXCPM_VERBOSE=1 to see them again.
+if not os.environ.get("VOXCPM_VERBOSE"):
+    warnings.filterwarnings("ignore", category=FutureWarning)
+    warnings.filterwarnings("ignore", category=UserWarning)
+    # torchaudio reads this to stop emitting the StreamReader/Writer deprecations.
+    os.environ.setdefault("TORCHAUDIO_NO_DEPRECATION_WARNING", "1")
 
 import numpy as np
 import soundfile as sf
