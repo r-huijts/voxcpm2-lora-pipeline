@@ -272,8 +272,11 @@ def generate_with_retry(
     for WER scoring — without the parenthetical or non-verbal tags, since the
     model should not voice those. Falls back to `text` when not provided.
 
-    Returns (best_audio, best_wer, attempts_used).
-    best_wer is -1.0 if ASR was skipped.
+    Returns (best_audio, best_wer, attempts_used, accepted_transcript).
+    best_wer is -1.0 if ASR was skipped; accepted_transcript is "" then too.
+    The transcript is the Whisper output of the KEPT attempt only, so a
+    pronunciation diff built from it reflects shipped audio, not discarded
+    retries.
     """
     wer_target = wer_reference if wer_reference is not None else text
     def _generate_once(ref_audio_latents) -> np.ndarray:
@@ -300,6 +303,7 @@ def generate_with_retry(
 
     best_audio = None
     best_wer = float("inf")
+    best_transcript = ""
     attempts = 0
 
     for attempt in range(1, max_retries + 2):  # +2: initial attempt + max_retries
@@ -308,8 +312,8 @@ def generate_with_retry(
         wav = trim_silence(wav, sample_rate)
 
         if asr_model is None:
-            # No ASR — accept immediately.
-            return wav, -1.0, attempts
+            # No ASR — accept immediately, no transcript available.
+            return wav, -1.0, attempts, ""
 
         transcript = _transcribe(asr_model, wav, sample_rate)
         current_wer = _compute_wer(wer_target, transcript)
@@ -317,6 +321,7 @@ def generate_with_retry(
         if best_audio is None or current_wer < best_wer:
             best_audio = wav
             best_wer = current_wer
+            best_transcript = transcript
 
         wer_pct = f"{current_wer * 100:.1f}%"
         if current_wer <= wer_threshold:
@@ -324,7 +329,7 @@ def generate_with_retry(
                 print(f"         [asr] attempt {attempt}: WER={wer_pct} ✓ accepted")
             else:
                 print(f"         [asr] WER={wer_pct} ✓")
-            return best_audio, best_wer, attempts
+            return best_audio, best_wer, attempts, best_transcript
 
         # Threshold exceeded.
         if attempt <= max_retries:
@@ -334,7 +339,7 @@ def generate_with_retry(
             print(f"         [asr] attempt {attempt}: WER={wer_pct} — "
                   f"retries exhausted, keeping best ({best_wer * 100:.1f}%)")
 
-    return best_audio, best_wer, attempts
+    return best_audio, best_wer, attempts, best_transcript
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -428,6 +433,75 @@ def clean_for_wer(text: str) -> str:
     text = _LEADING_PAREN_RE.sub("", text)
     text = _TAG_RE.sub(" ", text)
     return re.sub(r"\s+", " ", text).strip()
+
+
+def _diff_tokens(text: str) -> list[str]:
+    """
+    Tokenize for diffing: keep original case (so proper nouns are detectable),
+    strip surrounding punctuation but keep internal accents/hyphens.
+    """
+    text = _LEADING_PAREN_RE.sub("", text)
+    text = _TAG_RE.sub(" ", text)
+    toks = []
+    for raw in text.split():
+        # strip leading/trailing punctuation, keep inner chars (Évenepoel, Van-der)
+        t = raw.strip(".,;:!?\"'()[]…—–")
+        if t:
+            toks.append(t)
+    return toks
+
+
+def pronunciation_diff(reference_text: str, transcript: str) -> list[dict]:
+    """
+    Word-align the chunk's intended text against the ASR transcript of the
+    ACCEPTED audio, and return the substitutions — i.e. words the model was
+    asked to say that Whisper heard as something else. These are the candidate
+    mispronunciations.
+
+    Comparison is case-insensitive for matching (so capitalization alone isn't
+    flagged) but the ORIGINAL-cased reference word is reported, so proper nouns
+    stay recognizable and can be flagged. Insertions and deletions are ignored —
+    only true substitutions (said X, heard Y) are pronunciation signal.
+
+    Returns a list of {ref, heard, is_proper} dicts, in order of appearance.
+    """
+    ref_orig = _diff_tokens(reference_text)
+    hyp_orig = _diff_tokens(transcript)
+    ref_lc = [w.lower() for w in ref_orig]
+    hyp_lc = [w.lower() for w in hyp_orig]
+
+    # Standard Levenshtein alignment with backtrace over words.
+    m, n = len(ref_lc), len(hyp_lc)
+    dp = [[0] * (n + 1) for _ in range(m + 1)]
+    for i in range(m + 1):
+        dp[i][0] = i
+    for j in range(n + 1):
+        dp[0][j] = j
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            cost = 0 if ref_lc[i - 1] == hyp_lc[j - 1] else 1
+            dp[i][j] = min(dp[i - 1][j] + 1, dp[i][j - 1] + 1,
+                           dp[i - 1][j - 1] + cost)
+
+    subs = []
+    i, j = m, n
+    while i > 0 and j > 0:
+        cost = 0 if ref_lc[i - 1] == hyp_lc[j - 1] else 1
+        if dp[i][j] == dp[i - 1][j - 1] + cost:
+            if cost == 1:  # substitution
+                ref_w = ref_orig[i - 1]
+                subs.append({
+                    "ref": ref_w,
+                    "heard": hyp_orig[j - 1],
+                    "is_proper": ref_w[:1].isupper(),
+                })
+            i, j = i - 1, j - 1
+        elif dp[i][j] == dp[i - 1][j] + 1:
+            i -= 1  # deletion (ignored)
+        else:
+            j -= 1  # insertion (ignored)
+    subs.reverse()
+    return subs
 
 
 def concat_latents(*blobs: bytes | None, feat_dim: int) -> bytes | None:
@@ -725,6 +799,7 @@ def main():
     total_audio_s = 0.0
     total_retries = 0
     wer_log = []  # (chunk_id, wer, attempts)
+    pron_diffs = []  # [{id, ref, heard, is_proper}, ...] across accepted chunks
 
     for c in chunks:
         cid = int(c["id"])
@@ -814,7 +889,7 @@ def main():
 
         t_chunk = time.time()
 
-        wav, chunk_wer, attempts = generate_with_retry(
+        wav, chunk_wer, attempts, accepted_transcript = generate_with_retry(
             server=server,
             text=target_text,
             prompt_id=prompt_id,
@@ -841,6 +916,11 @@ def main():
         retries_this_chunk = attempts - 1
         total_retries += retries_this_chunk
         wer_log.append((cid, chunk_wer, attempts))
+
+        # Pronunciation diff from the ACCEPTED attempt's transcript only.
+        if accepted_transcript:
+            for sub in pronunciation_diff(clean_for_wer(text), accepted_transcript):
+                pron_diffs.append({"id": cid, **sub})
 
         elapsed = time.time() - t_start
         avg_s_per_chunk = elapsed / n_done
@@ -919,6 +999,78 @@ def main():
                 encoding="utf-8",
             )
             print(f"WER log:  {wer_log_path}")
+
+    # ── pronunciation diff ─────────────────────────────────────────────────
+    # Words the model was asked to say that Whisper heard differently, from
+    # ACCEPTED audio only. Manual fuel for building a respelling lexicon — the
+    # tool only records; you decide what (if anything) to do with each entry.
+    if pron_diffs:
+        # Tally by reference word (case-insensitive grouping, original case kept).
+        from collections import Counter, OrderedDict
+        counter = Counter()
+        display = {}
+        heard_examples = {}
+        proper = {}
+        for d in pron_diffs:
+            key = d["ref"].lower()
+            counter[key] += 1
+            display.setdefault(key, d["ref"])
+            proper[key] = proper.get(key, False) or d["is_proper"]
+            heard_examples.setdefault(key, [])
+            if d["heard"] not in heard_examples[key]:
+                heard_examples[key].append(d["heard"])
+
+        # Sort: proper nouns first, then by frequency.
+        ordered = sorted(
+            counter.keys(),
+            key=lambda k: (not proper[k], -counter[k], k),
+        )
+
+        diff_json = {
+            "summary": "Words asked-for vs heard by ASR, accepted audio only. "
+                       "Candidate mispronunciations for manual lexicon building.",
+            "total_substitutions": len(pron_diffs),
+            "unique_words": len(ordered),
+            "words": [
+                {
+                    "ref": display[k],
+                    "count": counter[k],
+                    "is_proper": proper[k],
+                    "heard_as": heard_examples[k],
+                    "chunks": sorted({d["id"] for d in pron_diffs
+                                      if d["ref"].lower() == k}),
+                }
+                for k in ordered
+            ],
+        }
+        diff_json_path = args.out_dir / "pronunciation_diff.json"
+        diff_json_path.write_text(
+            json.dumps(diff_json, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+        # Human-readable version — the one you actually scan.
+        lines = [
+            "PRONUNCIATION DIFF — accepted audio only",
+            "Words the model was asked to say vs what Whisper heard.",
+            "Proper nouns (capitalized) listed first; these are usual lexicon targets.",
+            "This is evidence only — decide manually what to respell.",
+            "",
+            f"{'WORD':<24} {'COUNT':>5}  {'PROPER':<7} HEARD AS",
+            "-" * 72,
+        ]
+        for k in ordered:
+            heard = ", ".join(heard_examples[k][:4])
+            lines.append(
+                f"{display[k]:<24} {counter[k]:>5}  "
+                f"{'yes' if proper[k] else '':<7} {heard}"
+            )
+        diff_txt_path = args.out_dir / "pronunciation_diff.txt"
+        diff_txt_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        n_proper = sum(1 for k in ordered if proper[k])
+        print(f"Pronunciation diff: {diff_txt_path}")
+        print(f"  {len(ordered)} unique mismatched words "
+              f"({n_proper} proper nouns) — review for lexicon candidates.")
 
     print(f"Manifest: {manifest_path}")
     print(f"Next: python 03_stitch.py --run-dir {args.out_dir} "
