@@ -477,6 +477,13 @@ def main():
     ap.add_argument("--no-control", action="store_true", default=False)
     ap.add_argument("--simple-control", default=None)
     ap.add_argument("--start-at", type=int, default=1)
+    ap.add_argument("--only-chunks", default=None,
+                    help="Regenerate ONLY these chunk IDs, leaving all other "
+                         "existing chunk wavs untouched. Comma-separated, e.g. "
+                         "'7' or '4,7'. Requires a previous run's wavs in "
+                         "--out-dir. The manifest is preserved; only the named "
+                         "chunks' audio is replaced. Use this to fix a few bad "
+                         "chunks without re-running the whole column.")
     ap.add_argument("--controllable", action="store_true", default=False,
                     help="Use Controllable Cloning instead of Hi-Fi. Drops the "
                          "reference transcript (timbre via encoded latents only) "
@@ -516,6 +523,17 @@ def main():
                                 "keeping the best result (default 2).")
 
     args = ap.parse_args()
+
+    # Parse --only-chunks into a set of ints (or None for "all").
+    only_chunks = None
+    if args.only_chunks is not None:
+        try:
+            only_chunks = {int(x) for x in args.only_chunks.split(",") if x.strip()}
+        except ValueError:
+            sys.exit(f"--only-chunks must be comma-separated integers; "
+                     f"got {args.only_chunks!r}")
+        if not only_chunks:
+            sys.exit("--only-chunks was empty.")
 
     # ── validate inputs ────────────────────────────────────────────────────
     if not args.plan.exists():
@@ -683,6 +701,10 @@ def main():
 
     n_total = len(chunks)
     n_to_generate = sum(1 for c in chunks if int(c["id"]) >= args.start_at)
+    if only_chunks is not None:
+        print(f"REGENERATING ONLY chunks {sorted(only_chunks)} — all other "
+              f"existing wavs in {args.out_dir} are kept untouched.")
+        n_to_generate = len(only_chunks)
     print(f"Generating {n_total} chunks "
           f"(cfg={args.cfg}, timesteps={args.timesteps}, "
           f"temperature={args.temperature}, "
@@ -736,6 +758,30 @@ def main():
 
         if cid < args.start_at:
             print(f"[{cid:03d}/{n_total:03d}] skipped (resume)")
+            continue
+
+        # --only-chunks: regenerate just the named chunks. For a chunk NOT in
+        # the set, load its existing wav, recompute the carry-over tail from it
+        # (so the next targeted chunk still gets correct prosody continuity),
+        # and skip generation. The existing audio is left on disk untouched.
+        if only_chunks is not None and cid not in only_chunks:
+            if wav_path.exists():
+                try:
+                    existing, _sr = sf.read(wav_path, dtype="float32")
+                    if existing.ndim > 1:
+                        existing = existing.mean(axis=1)
+                    tail_samples = int(args.prosody_tail * sample_rate)
+                    tail = existing[-tail_samples:] if existing.size > tail_samples else existing
+                    prev_ref_latents = server.encode_latents(
+                        ndarray_to_wav_bytes(tail, sample_rate), "wav"
+                    )
+                    print(f"[{cid:03d}/{n_total:03d}] kept (existing); carry-over refreshed")
+                except Exception as e:
+                    print(f"[{cid:03d}/{n_total:03d}] kept (existing); "
+                          f"WARNING could not read for carry-over: {e}")
+            else:
+                print(f"[{cid:03d}/{n_total:03d}] kept — but no existing wav at "
+                      f"{wav_name}; carry-over unchanged")
             continue
 
         ref_carry = "yes" if prev_ref_latents else "no"
@@ -842,15 +888,31 @@ def main():
                   f"{worst[2]} attempts)")
 
             wer_log_path = args.out_dir / "wer_log.json"
+            new_entries = {cid: {"id": cid, "wer": round(w, 4), "attempts": a}
+                           for cid, w, a in valid_wers}
+
+            # In --only-chunks mode, merge the regenerated chunks' results into
+            # the existing wer_log rather than replacing the whole file with a
+            # partial one.
+            merged = dict(new_entries)
+            if only_chunks is not None and wer_log_path.exists():
+                try:
+                    prior = json.loads(wer_log_path.read_text(encoding="utf-8"))
+                    for entry in prior.get("chunks", []):
+                        if entry["id"] not in merged:
+                            merged[entry["id"]] = entry
+                except Exception as e:
+                    print(f"WARNING: could not merge prior wer_log: {e}")
+
+            chunks_sorted = [merged[k] for k in sorted(merged)]
+            all_wers = [e["wer"] for e in chunks_sorted]
             wer_log_data = {
-                "avg_wer": round(avg_wer, 4),
+                "avg_wer": round(sum(all_wers) / len(all_wers), 4) if all_wers else 0.0,
                 "total_retries": total_retries,
                 "threshold": args.wer_threshold,
                 "whisper_model": args.whisper_model,
-                "chunks": [
-                    {"id": cid, "wer": round(w, 4), "attempts": a}
-                    for cid, w, a in valid_wers
-                ],
+                "regenerated": sorted(only_chunks) if only_chunks else "all",
+                "chunks": chunks_sorted,
             }
             wer_log_path.write_text(
                 json.dumps(wer_log_data, ensure_ascii=False, indent=2),
