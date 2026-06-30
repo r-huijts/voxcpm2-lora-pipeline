@@ -115,15 +115,27 @@ mogen er tijdelijk van afwijken, maar keren er altijd naar terug.
 STAP 2 — GROEPEER tot delivery units
 ════════════════════════════════════════════════════════
 Een delivery unit = een span die als één doorlopende ademhaling wordt \
-uitgesproken. Regels:
+uitgesproken.
+
+ALGEMENE VOORKEUR — HOUD FRAGMENTEN KORT. De stem wordt per fragment \
+opnieuw verankerd aan de originele referentie, dus lange fragmenten zijn \
+NIET nodig voor stemconsistentie. Kortere fragmenten zijn juist stabieler: \
+de stem dwaalt minder af binnen één generatie, de uitspraak blijft scherper, \
+en een mislukt fragment is goedkoper opnieuw te genereren. Mik op compacte \
+eenheden van ongeveer één zin. Groepeer alleen wanneer zinnen echt één \
+ademhaling vormen — niet uit gewoonte.
+
+Regels:
 
   a. Gebruik ALLEEN hele zinnen. Splits nooit binnen een zin.
 
-  b. Groepeer zinnen die samen één gedachte of retorische beweging vormen \
-     (opbouw + clou, vraag + antwoord, opsomming, tegenstelling).
+  b. STANDAARD: één zin = één fragment. Groepeer twee (zelden drie) zinnen \
+     ALLEEN als ze samen één korte, ononderbroken retorische beweging vormen \
+     (opbouw + clou, vraag + antwoord, korte tegenstelling) én samen onder de \
+     maximumlengte blijven (regel e). Bij twijfel: splits, niet groeperen.
 
-  c. Een lange zin mag een eigen fragment zijn. Een korte, volledige \
-     gedachte ook — maar zie regel (d).
+  c. Een lange zin is een eigen fragment. Een korte volledige gedachte ook — \
+     mits boven de minimumlengte (regel d).
 
   d. MINIMUMLENGTE — isoleer nooit een fragment van minder dan ~6 woorden. \
      De TTS-stem heeft minstens ~1,5 seconde spraak nodig om te \
@@ -132,11 +144,20 @@ uitgesproken. Regels:
      samen met de aangrenzende zin. Dramatische pauzes creëer je met \
      gap_after_ms, niet met losse mini-fragmenten.
 
-  e. Let op retorische staccato: reeksen van korte zinnen die samen één \
-     sfeer neerzetten (bv. "Rome. De Eeuwige Stad. Je loopt er rond…") \
-     horen bij elkaar in één fragment — ook al zijn het meerdere zinnen.
+  e. MAXIMUMLENGTE — streef naar fragmenten van ten hoogste ~25 woorden \
+     (ruwweg tien seconden spraak). Overschrijd dit alleen wanneer één enkele \
+     zin langer is — een zin splits je nooit (regel a). Komt een gegroepeerd \
+     fragment boven de ~25 woorden uit, splits het dan in losse zinnen. \
+     Lange fragmenten zijn de plek waar uitspraak en cadans wegzakken; \
+     vermijd ze.
 
-  f. Gebruik je oor: waar zou een verteller ademhalen? Dáár is de grens.
+  f. Let op retorische staccato: reeksen van zeer korte zinnen die samen één \
+     sfeer neerzetten (bv. "Rome. De Eeuwige Stad. Je loopt er rond…") mogen \
+     samen in één fragment — mits dat onder de maximumlengte blijft. Dit is \
+     de enige reden om meer dan twee zinnen te groeperen.
+
+  g. Gebruik je oor: waar zou een verteller ademhalen? Dáár is de grens. \
+     Bij narratie ademt een verteller vaak na elke zin — volg dat ritme.
 
 ════════════════════════════════════════════════════════
 STAP 3 — POSITIE in de gedachtegang
@@ -416,6 +437,14 @@ def validate_plan(plan: dict, expected_sentence_ids: set[str] | None = None) -> 
                 warnings.append(f"Chunk {cid}: unknown non-verbal tag {t!r} "
                                 f"(allowed: {sorted(ALLOWED_TAGS)})")
         total_tags += len(tags_in_chunk)
+        # Length check — flag over-long units (strip tags first so they don't
+        # count as words). Soft warning; a single long sentence can legitimately
+        # exceed this since sentences are never split.
+        wordcount = len(_TAG_RE.sub(" ", text).split())
+        if wordcount > 30:
+            warnings.append(f"Chunk {cid}: {wordcount} words — over the ~25-word "
+                            f"target; pronunciation/cadence tend to sag here. "
+                            f"Split unless it's a single unbreakable sentence.")
     if chunks and chunks[-1].get("gap_after_ms") not in (0, 0.0):
         warnings.append("Last chunk's gap_after_ms should be 0.")
     # Tags should be rare. Flag if the LLM got tag-happy.
