@@ -182,38 +182,57 @@ def _transcribe(asr_model, audio: np.ndarray, sr: int) -> str:
     return " ".join(s.text.strip() for s in segments).strip()
 
 
+def _normalize_for_wer(text: str) -> str:
+    """
+    Lowercase, strip punctuation, collapse whitespace. Done in plain Python so
+    we don't depend on jiwer's transform API, which changed incompatibly between
+    2.x / 3.x / 4.x (truth_transform -> reference_transform, plus a 3.0 bug where
+    the renamed kwarg produced wrong results). We hand jiwer already-clean
+    strings and let it just count edits.
+    """
+    text = text.lower()
+    # Drop anything that isn't a letter, digit, or whitespace (Unicode-aware,
+    # so Dutch accented chars in rider names survive).
+    text = "".join(ch if (ch.isalnum() or ch.isspace()) else " " for ch in text)
+    return " ".join(text.split())
+
+
+def _word_levenshtein_wer(reference: str, hypothesis: str) -> float:
+    """Pure-Python word-level WER fallback (no jiwer)."""
+    ref_words = reference.split()
+    hyp_words = hypothesis.split()
+    if not ref_words:
+        return 0.0 if not hyp_words else 1.0
+    m, n = len(ref_words), len(hyp_words)
+    dp = list(range(n + 1))
+    for i in range(1, m + 1):
+        prev, dp[0] = dp[0], i
+        for j in range(1, n + 1):
+            temp = dp[j]
+            if ref_words[i - 1] == hyp_words[j - 1]:
+                dp[j] = prev
+            else:
+                dp[j] = 1 + min(prev, dp[j], dp[j - 1])
+            prev = temp
+    return dp[n] / m
+
+
 def _compute_wer(reference: str, hypothesis: str) -> float:
-    """Compute Word Error Rate between reference text and ASR hypothesis."""
+    """
+    Word Error Rate between reference text and ASR hypothesis. Normalization is
+    applied in Python first (see _normalize_for_wer), then jiwer just counts
+    edits on the clean strings — version-agnostic. Falls back to a pure-Python
+    Levenshtein WER if jiwer isn't installed.
+    """
+    ref = _normalize_for_wer(reference)
+    hyp = _normalize_for_wer(hypothesis)
+    if not ref.split():
+        return 0.0 if not hyp.split() else 1.0
     try:
-        from jiwer import wer, transforms
-        # Minimal Dutch normalization: lowercase, strip punctuation.
-        transform = transforms.Compose([
-            transforms.ToLowerCase(),
-            transforms.RemovePunctuation(),
-            transforms.RemoveMultipleSpaces(),
-            transforms.Strip(),
-        ])
-        return wer(reference, hypothesis, truth_transform=transform,
-                   hypothesis_transform=transform)
+        from jiwer import wer
+        return wer(ref, hyp)
     except ImportError:
-        # Fallback: naive word-overlap WER without jiwer.
-        ref_words = reference.lower().split()
-        hyp_words = hypothesis.lower().split()
-        if not ref_words:
-            return 0.0
-        # Levenshtein at word level — simple DP.
-        m, n = len(ref_words), len(hyp_words)
-        dp = list(range(n + 1))
-        for i in range(1, m + 1):
-            prev, dp[0] = dp[0], i
-            for j in range(1, n + 1):
-                temp = dp[j]
-                if ref_words[i - 1] == hyp_words[j - 1]:
-                    dp[j] = prev
-                else:
-                    dp[j] = 1 + min(prev, dp[j], dp[j - 1])
-                prev = temp
-        return dp[n] / m
+        return _word_levenshtein_wer(ref, hyp)
 
 
 def generate_with_retry(
