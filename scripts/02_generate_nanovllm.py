@@ -597,10 +597,29 @@ def main():
     # Without regrounding the slot holds only the previous chunk's tail, so the
     # voice clones a clone and drifts. We re-inject the original reference here.
     ref_anchor_latents = zero_shot_latents  # original reference (bytes) or None
+    # feat_dim is in the model_info dict we already fetched at startup. Fall back
+    # to attribute paths, then to the model default (64) if all else fails.
+    feat_dim = None
     try:
-        feat_dim = int(server.llm.feat_dim)
+        feat_dim = int(model_info["feat_dim"])
     except Exception:
-        feat_dim = None
+        for getter in (
+            lambda: int(server.llm.feat_dim),
+            lambda: int(server.config.model_config.feat_dim),
+        ):
+            try:
+                feat_dim = getter()
+                break
+            except Exception:
+                continue
+    if feat_dim is None and ref_anchor_latents is not None:
+        # Last resort: infer from the reference blob length. VoxCPM2 feat_dim
+        # is 64; verify the blob divides evenly before trusting it.
+        n_floats = len(ref_anchor_latents) // 4  # float32
+        if n_floats % 64 == 0:
+            feat_dim = 64
+    if feat_dim is not None:
+        print(f"feat_dim={feat_dim} (for regrounding latent concatenation).")
 
     # Cap the regrounding anchor so [anchor + tail + long chunk] can't overflow
     # max_model_len. The reference clip is usually short, but a hard cap is
