@@ -596,6 +596,15 @@ def main():
                            help="Max regeneration attempts per chunk before "
                                 "keeping the best result (default 2).")
 
+    ap.add_argument("--interactive", action="store_true", default=False,
+                    help="After the run, keep the model loaded and drop into a "
+                         "prompt for regenerating individual chunks fast (no "
+                         "reload). Commands: '<id>' regenerates a chunk, "
+                         "'<id> --cfg 1.7 --temp 0.9' overrides settings, "
+                         "'reload' re-reads the plan (pick up lexicon/plan edits), "
+                         "'list' shows chunks, 'quit' exits. Pair with "
+                         "--only-chunks to skip the initial full run.")
+
     args = ap.parse_args()
 
     # Parse --only-chunks into a set of ints (or None for "all").
@@ -1075,6 +1084,125 @@ def main():
     print(f"Manifest: {manifest_path}")
     print(f"Next: python 03_stitch.py --run-dir {args.out_dir} "
           f"--output {args.out_dir / 'final.wav'}")
+
+    # ── interactive regeneration loop ──────────────────────────────────────
+    if interactive:
+        import shlex
+
+        def _carry_from_prev(prev_id: int) -> bytes | None:
+            """Rebuild carry-over latents from the preceding chunk's existing wav."""
+            if prev_id < 1:
+                return None
+            pj = plan_lookup.get(prev_id)
+            if pj is None:
+                return None
+            pw = args.out_dir / f"chunk_{prev_id:04d}.wav"
+            if not pw.exists():
+                return None
+            try:
+                ex, _ = sf.read(pw, dtype="float32")
+                if ex.ndim > 1:
+                    ex = ex.mean(axis=1)
+                ts = int(args.prosody_tail * sample_rate)
+                tl = ex[-ts:] if ex.size > ts else ex
+                return server.encode_latents(ndarray_to_wav_bytes(tl, sample_rate), "wav")
+            except Exception:
+                return None
+
+        def _regen(cid: int, cfg_v: float, temp_v: float):
+            c = plan_lookup.get(cid)
+            if c is None:
+                print(f"  no chunk with id {cid} in the plan.")
+                return
+            text = c["text"]
+            control = c.get("control", "")
+            if args.controllable and control.strip():
+                target_text = apply_control(text, control)
+            else:
+                target_text = text
+
+            # carry-over from the previous chunk id in the plan order
+            ids_sorted = sorted(plan_lookup)
+            pos = ids_sorted.index(cid)
+            prev_id = ids_sorted[pos - 1] if pos > 0 else 0
+            prev_latents = _carry_from_prev(prev_id)
+
+            # ref slot: mirror the batch logic
+            if not args.controllable or ref_anchor_latents is None or reground_mode == "off":
+                chunk_ref = prev_latents
+            elif reground_mode == "every":
+                chunk_ref = concat_latents(ref_anchor_latents, prev_latents, feat_dim=feat_dim)
+            else:
+                chunk_ref = ref_anchor_latents if prev_latents is None else prev_latents
+
+            print(f"  regen chunk {cid} @ cfg={cfg_v} temp={temp_v}: "
+                  f"{text[:50]}{'...' if len(text) > 50 else ''}")
+            wav, wer, att, _tr = generate_with_retry(
+                server=server, text=target_text, prompt_id=prompt_id,
+                ref_latents=chunk_ref, zero_shot_latents=zero_shot_latents,
+                cfg=cfg_v, temperature=temp_v,
+                max_generate_length=args.max_generate_length,
+                lora_name=LORA_NAME, asr_model=asr_model,
+                wer_threshold=args.wer_threshold, max_retries=args.max_retries,
+                sample_rate=sample_rate, wer_reference=clean_for_wer(target_text),
+            )
+            outp = args.out_dir / f"chunk_{cid:04d}.wav"
+            sf.write(outp, wav, sample_rate, subtype="PCM_16")
+            wtxt = f" WER={wer*100:.1f}%" if wer >= 0 else ""
+            print(f"  wrote {outp.name} ({len(wav)/sample_rate:.1f}s{wtxt})")
+
+        # Build/refresh the id->chunk lookup from the current plan.
+        def _load_plan_lookup():
+            p = json.loads(args.plan.read_text(encoding="utf-8"))
+            return {int(c["id"]): c for c in p.get("chunks", [])}
+
+        plan_lookup = _load_plan_lookup()
+
+        print("\n" + "=" * 60)
+        print("INTERACTIVE MODE — model stays loaded.")
+        print("  <id>                  regenerate that chunk")
+        print("  <id> --cfg 1.7 --temp 0.9   with overrides")
+        print("  reload                re-read plan.json (after lexicon/plan edits)")
+        print("  list                  show chunk ids + text starts")
+        print("  quit                  exit")
+        print("=" * 60)
+
+        while True:
+            try:
+                raw = input("regen> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+            if not raw:
+                continue
+            if raw in ("quit", "exit", "q"):
+                break
+            if raw == "reload":
+                plan_lookup = _load_plan_lookup()
+                print(f"  plan reloaded ({len(plan_lookup)} chunks).")
+                continue
+            if raw == "list":
+                for k in sorted(plan_lookup):
+                    t = plan_lookup[k]["text"]
+                    print(f"  {k:3d}  {t[:60]}{'...' if len(t) > 60 else ''}")
+                continue
+            # parse: <id> [--cfg X] [--temp Y]
+            try:
+                parts = shlex.split(raw)
+                cid = int(parts[0])
+                cfg_v, temp_v = args.cfg, args.temperature
+                i = 1
+                while i < len(parts):
+                    if parts[i] in ("--cfg",) and i + 1 < len(parts):
+                        cfg_v = float(parts[i + 1]); i += 2
+                    elif parts[i] in ("--temp", "--temperature") and i + 1 < len(parts):
+                        temp_v = float(parts[i + 1]); i += 2
+                    else:
+                        i += 1
+            except (ValueError, IndexError):
+                print("  usage: <id> [--cfg X] [--temp Y] | reload | list | quit")
+                continue
+            _regen(cid, cfg_v, temp_v)
 
     server.stop()
 
