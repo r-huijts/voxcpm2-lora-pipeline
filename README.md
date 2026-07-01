@@ -10,7 +10,7 @@ everything that makes spoken delivery sound human: pacing, breath, the shape
 of a sentence building to a punchline.
 
 **What this pipeline does about it:**
-- **Clones a specific voice with a LoRA** (currently: Mart Smeets) — real
+- **Clones a specific voice with a LoRA** real
   identity, not just a reference-clip approximation.
 - **Has an LLM read the whole column first** and split it into variable-size
   "delivery units" — complete spoken thoughts — instead of fixed-size chunks.
