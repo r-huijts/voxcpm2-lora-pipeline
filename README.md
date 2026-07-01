@@ -69,6 +69,12 @@ wins over the script's built-in default. Only genuinely per-run values
 `voice.json` holds real filesystem paths, not secrets — keep `PORTKEY_API_KEY`
 in `.env` instead (see Stage 1 below). `voice.json` is gitignored by default.
 
+`controllable` and `loudnorm` can also be set in `voice.json` (e.g. if a
+project always wants Controllable Cloning or always wants loudness mastering).
+Both accept an explicit `--no-controllable` / `--no-loudnorm` on the command
+line to force them off for a single run even when `voice.json` sets them
+`true`.
+
 ## Stage 1 — chunk (LLM)
 
 ```bash
@@ -146,6 +152,17 @@ is kept. Disable with `--no-asr`.
 IDs in an existing `--out-dir`, leaving the rest untouched. `--interactive`
 keeps the model loaded after the run and drops into a prompt for fast one-off
 regeneration without a reload.
+
+**Running Stage 2 + 3 together.** Unlike chunk → generate, generate → stitch
+never needs a manual pause in between, so `scripts/generate_and_stitch.py`
+runs both with one command — it accepts every flag from both scripts, forwards
+each to the right one, and defaults `--run-dir`/`--output` from `--out-dir`:
+
+```bash
+python scripts/generate_and_stitch.py \
+  --plan plan.json --out-dir /workspace/narration/run01 \
+  --loudnorm --lufs -16
+```
 
 ## Stage 3 — stitch
 

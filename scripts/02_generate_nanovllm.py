@@ -175,7 +175,7 @@ def _load_asr(whisper_model: str):
         from faster_whisper import WhisperModel
         print(f"[asr] Loading faster-whisper '{whisper_model}'...")
         model = WhisperModel(whisper_model, device="cuda", compute_type="float16")
-        print(f"[asr] Ready.\n")
+        print("[asr] Ready.\n")
         return model
     except ImportError:
         print(
@@ -558,7 +558,7 @@ def main():
                          "--out-dir. The manifest is preserved; only the named "
                          "chunks' audio is replaced. Use this to fix a few bad "
                          "chunks without re-running the whole column.")
-    ap.add_argument("--controllable", action="store_true", default=False,
+    ap.add_argument("--controllable", action=argparse.BooleanOptionalAction, default=False,
                     help="Use Controllable Cloning instead of Hi-Fi. Drops the "
                          "reference transcript (timbre via encoded latents only) "
                          "so the per-chunk (control instruction) parenthetical is "
@@ -607,14 +607,15 @@ def main():
 
     CONFIGURABLE = {"lora", "reference", "reference_text_file", "cfg", "timesteps",
                      "temperature", "max_generate_length", "prosody_tail",
-                     "gpu_memory_utilization", "max_model_len", "reground",
-                     "reground_anchor_frames", "whisper_model", "wer_threshold",
-                     "max_retries"}
+                     "gpu_memory_utilization", "max_model_len", "controllable",
+                     "reground", "reground_anchor_frames", "whisper_model",
+                     "wer_threshold", "max_retries"}
     ap.add_argument("--config", type=Path, default=Path("voice.json"),
                     help="Shared per-voice defaults JSON (see scripts/_pipeline_config.py "
                          "and scripts/voice.example.json). Lets --lora/--reference/tuning "
                          "flags be set once per project instead of retyped every run. "
-                         "CLI flags always override it.")
+                         "CLI flags always override it (pass --no-controllable to force "
+                         "Hi-Fi for one run even if voice.json sets controllable: true).")
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--config", type=Path, default=Path("voice.json"))
     config = load_voice_config(pre.parse_known_args()[0].config)
@@ -1041,7 +1042,7 @@ def main():
     # tool only records; you decide what (if anything) to do with each entry.
     if pron_diffs:
         # Tally by reference word (case-insensitive grouping, original case kept).
-        from collections import Counter, OrderedDict
+        from collections import Counter
         counter = Counter()
         display = {}
         heard_examples = {}
@@ -1106,9 +1107,12 @@ def main():
         print(f"Pronunciation diff: {diff_txt_path}")
         print(f"  {len(ordered)} unique mismatched words "
               f"({n_proper} proper nouns) — review for lexicon candidates.")
+    elif asr_model is not None:
+        print("Pronunciation diff: no mismatches found across accepted chunks "
+              "(no pronunciation_diff.json/.txt written).")
 
     print(f"Manifest: {manifest_path}")
-    print(f"Next: python 03_stitch.py --run-dir {args.out_dir} "
+    print(f"Next: python scripts/03_stitch.py --run-dir {args.out_dir} "
           f"--output {args.out_dir / 'final.wav'}")
 
     # ── interactive regeneration loop ──────────────────────────────────────

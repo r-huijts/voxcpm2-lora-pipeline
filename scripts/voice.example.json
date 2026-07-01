@@ -1,5 +1,5 @@
 {
-  "_comment": "Copy to voice.json in the directory you run the pipeline from. CLI flags always override these values. Secrets (PORTKEY_API_KEY) do NOT go here -- keep those in .env.",
+  "_comment": "Copy to voice.json in the directory you run the pipeline from. CLI flags always override these values (--no-controllable / --no-loudnorm force a boolean off for one run even if set true here). Secrets (PORTKEY_API_KEY) do NOT go here -- keep those in .env. Optional booleans not set below: controllable (default false = Hi-Fi mode), loudnorm (default false).",
 
   "lora": "/workspace/voxcpm_lora/checkpoints/lora/latest",
   "reference": "/workspace/voxcpm_project/references/ref_voice.wav",

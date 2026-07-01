@@ -40,7 +40,6 @@ Requires: numpy, soundfile. Optional: ffmpeg (for --loudnorm).
 """
 import argparse
 import json
-import subprocess
 import sys
 from pathlib import Path
 
@@ -141,7 +140,7 @@ def main():
                     help="Crossfade at every seam (else from manifest config).")
     ap.add_argument("--no-trim", action="store_true",
                     help="Don't trim per-chunk leading/trailing silence.")
-    ap.add_argument("--loudnorm", action="store_true",
+    ap.add_argument("--loudnorm", action=argparse.BooleanOptionalAction, default=False,
                     help="Apply final EBU R128 loudness normalization (ffmpeg).")
     ap.add_argument("--lufs", type=float, default=-16.0,
                     help="Target integrated loudness (-23 broadcast, -16 podcast).")
@@ -152,13 +151,14 @@ def main():
                          "falls back to the plain chunk_NNNN.wav. Defaults to "
                          "selection.json in --run-dir if present.")
 
-    CONFIGURABLE = {"gap_scale", "crossfade_ms", "lufs"}
+    CONFIGURABLE = {"gap_scale", "crossfade_ms", "lufs", "loudnorm"}
     ap.add_argument("--config", type=Path, default=Path("voice.json"),
                     help="Shared per-voice defaults JSON (see scripts/_pipeline_config.py "
                          "and scripts/voice.example.json). Keys: gap_scale, crossfade_ms, "
-                         "lufs. CLI flags always override it; note that a gap_scale/"
-                         "crossfade_ms set here takes priority over the values baked "
-                         "into this run's manifest.json.")
+                         "lufs, loudnorm. CLI flags always override it (pass "
+                         "--no-loudnorm to force it off for one run even if voice.json "
+                         "sets it); a gap_scale/crossfade_ms set here also takes "
+                         "priority over the values baked into this run's manifest.json.")
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--config", type=Path, default=Path("voice.json"))
     config = load_voice_config(pre.parse_known_args()[0].config)
@@ -180,9 +180,11 @@ def main():
 
     # Load the candidate selection map, if any.
     sel_path = args.selection
+    sel_source = "--selection"
     if sel_path is None:
         default_sel = args.run_dir / "selection.json"
         sel_path = default_sel if default_sel.exists() else None
+        sel_source = "auto-detected"
     selection = {}
     if sel_path is not None:
         if not sel_path.exists():
@@ -192,11 +194,20 @@ def main():
             if str(k).startswith("_"):
                 continue  # allow comment keys
             selection[int(k)] = int(v)
-        print(f"Selection loaded ({len(selection)} picks) from {sel_path.name}")
+        print(f"Selection loaded ({len(selection)} picks) from {sel_path.name} ({sel_source})")
 
     cfg = manifest.get("config", {})
-    gap_scale = args.gap_scale if args.gap_scale is not None else cfg.get("gap_scale", 1.0)
-    crossfade_ms = args.crossfade_ms if args.crossfade_ms is not None else cfg.get("crossfade_ms", 40)
+    manifest_gap_scale = cfg.get("gap_scale", 1.0)
+    manifest_crossfade_ms = cfg.get("crossfade_ms", 40)
+    gap_scale = args.gap_scale if args.gap_scale is not None else manifest_gap_scale
+    crossfade_ms = args.crossfade_ms if args.crossfade_ms is not None else manifest_crossfade_ms
+
+    if args.gap_scale is not None and args.gap_scale != manifest_gap_scale:
+        print(f"NOTE: using gap_scale={gap_scale} (from --gap-scale or voice.json), "
+              f"overriding this run's manifest value of {manifest_gap_scale}.", file=sys.stderr)
+    if args.crossfade_ms is not None and args.crossfade_ms != manifest_crossfade_ms:
+        print(f"NOTE: using crossfade_ms={crossfade_ms} (from --crossfade-ms or voice.json), "
+              f"overriding this run's manifest value of {manifest_crossfade_ms}.", file=sys.stderr)
 
     print(f"Stitching {len(items)} chunks "
           f"(gap_scale={gap_scale}, crossfade={crossfade_ms}ms)")
