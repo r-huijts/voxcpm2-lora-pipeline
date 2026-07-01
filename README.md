@@ -1,7 +1,14 @@
-# narrate/ — LLM-chunked long-form narration with the trained LoRA
+# voxcpm2-lora-pipeline — long-form voice narration
 
-Three stages, run on the pod. Turns a full Dutch column into finished narration
-in the trained Mart-Smeets voice, with natural pauses and per-chunk cadence.
+Turns a plain-text column into a finished narration audio file, spoken in a
+specific cloned voice (currently: Mart Smeets). It's built on
+[VoxCPM2](https://github.com/OpenBMB/VoxCPM), a voice-cloning TTS model, using
+a LoRA fine-tuned on that voice's recordings for timbre, plus an LLM-driven
+chunking step for natural pacing. Three stages, run on a GPU pod (see
+Pipeline below for the full diagram).
+
+The LoRA itself is trained separately, once per voice, outside this repo —
+here you only need a finished checkpoint (see Requirements below).
 
 The design principle: **variable-size chunks decided by an LLM that reads the
 whole column**, not fixed rules. Each chunk is one "delivery unit" — a complete
@@ -13,27 +20,61 @@ the model never has to generate silence.
 Why not one long generation: VoxCPM2 accelerates ("rushes") on long single-shot
 text. Chunking removes that at the source — each chunk is too short to drift.
 
+## Requirements
+
+- **VoxCPM2 + `nano-vllm-voxcpm`** installed on the pod, plus the rest of
+  `requirements.txt`: `pip install -r requirements.txt`
+- **ffmpeg** on `PATH` (used for reference-clip conversion and optional
+  loudness mastering)
+- **A trained LoRA checkpoint** for your voice — a `checkpoints/lora/...`
+  directory containing `lora_config.json` + `*.safetensors` weights
+- **A reference clip** of the target voice (a few seconds of clean audio, plus
+  its transcript) for Stage 2 to anchor timbre against
+- **A Portkey API key** for Stage 1 only (the chunking LLM call) — see Stage 1
+  below for how to set it
+
 ## Pipeline
 
 ```
 column.txt
-   │  01_chunk.py   (LLM via Portkey: chunk + respell + tag + gap)
+   │  01_chunk.py            (LLM via Portkey: chunk + respell + tag + gap)
    ▼
 plan.json   ← YOU REVIEW AND EDIT THIS
-   │  02_generate.py   (999 LoRA, Mode 1, reference re-anchor per chunk)
+   │  02_generate_nanovllm.py   (LoRA, reference re-anchor + ASR quality gate per chunk)
    ▼
 run-dir/chunk_*.wav + manifest.json
-   │  03_stitch.py   (trim, crossfade, insert short/long pauses)
+   │  03_stitch.py           (trim, crossfade, insert short/long pauses)
    ▼
 final.wav
 ```
+
+## Reusing settings across runs — `voice.json`
+
+`--lora`, `--reference`, and most tuning flags (`--cfg`, `--gap-scale`,
+`--whisper-model`, ...) are stable for a given voice/project, not per-run. Copy
+`scripts/voice.example.json` to `voice.json` in the directory you run the
+pipeline from and fill in your paths:
+
+```bash
+cp scripts/voice.example.json voice.json && nano voice.json
+```
+
+All three scripts auto-load `./voice.json` (override with `--config <path>`)
+and use it to fill in defaults for the flags listed in the file — anything you
+still pass on the command line wins over the config, and anything in the config
+wins over the script's built-in default. Only genuinely per-run values
+(`--input`/`--output`, `--plan`, `--out-dir`, `--run-dir`) are never read from
+`voice.json`, so it can't accidentally clobber a specific run.
+
+`voice.json` holds real filesystem paths, not secrets — keep `PORTKEY_API_KEY`
+in `.env` instead (see Stage 1 below). `voice.json` is gitignored by default.
 
 ## Stage 1 — chunk (LLM)
 
 ```bash
 pip install portkey-ai pysbd
 export PORTKEY_API_KEY=...
-python narrate/01_chunk.py --input column.txt --output plan.json --model gpt-4o
+python scripts/01_chunk.py --input column.txt --output plan.json --model gpt-4o
 # optional: --config-id pc-xxxx  --gap-scale 1.0  --crossfade-ms 40
 ```
 
@@ -73,30 +114,49 @@ Produces `plan.json`. Each chunk carries:
 see at a glance which chunks it thinks resolve vs. flow, and correct that directly.
 Editing a pause is just changing the `gap_after_ms` integer.
 
+**Pronunciation lexicon.** `scripts/lexicon.json` holds CONFIRMED respellings
+(`{"klassementsman": "klassements-man"}`) applied to the column before chunking.
+Only add entries you've verified by ear — a wrong respelling can move the error
+rather than fix it. Skip it entirely with `--no-lexicon`.
+
 ## Stage 2 — generate
 
 ```bash
-python narrate/02_generate.py \
+python scripts/02_generate_nanovllm.py \
   --plan plan.json \
   --lora /workspace/voxcpm2-lora-pipeline/checkpoints/lora/step_0000999 \
   --reference /workspace/voxcpm_project/references/ref_voice.wav \
   --out-dir /workspace/narration/run01
 # tuning: --cfg 1.5  --timesteps 24  --start-at 12 (resume)
+# with voice.json set up, --lora/--reference/tuning flags can be omitted
 ```
 
-Mode 1 (Controllable Cloning): the LoRA gives the voice, the reference clip is
-re-anchored on every chunk to fight drift, the per-chunk control tag steers
-cadence. `normalize` is OFF by default — the LLM already expanded numbers/names.
-Writes `chunk_0001.wav ...` and `manifest.json`.
+Hi-Fi mode (default): the reference clip + its transcript anchor the voice
+directly; control tags are ignored. Pass `--controllable` for Controllable
+Cloning instead — the LoRA gives the voice, the reference clip is re-anchored
+each chunk to fight drift (`--reground`), and the per-chunk control tag steers
+cadence. Writes `chunk_0001.wav ...` and `manifest.json`.
+
+**ASR quality gate.** After each chunk, faster-whisper transcribes it and jiwer
+scores Word Error Rate against the intended text; chunks over `--wer-threshold`
+(default 0.15) are regenerated up to `--max-retries` times and the best attempt
+is kept. Disable with `--no-asr`.
+
+**Fixing individual chunks.** `--only-chunks 4,7` regenerates just those chunk
+IDs in an existing `--out-dir`, leaving the rest untouched. `--interactive`
+keeps the model loaded after the run and drops into a prompt for fast one-off
+regeneration without a reload.
 
 ## Stage 3 — stitch
 
 ```bash
-python narrate/03_stitch.py \
+python scripts/03_stitch.py \
   --run-dir /workspace/narration/run01 \
   --output /workspace/narration/run01/final.wav
-# mastering: --loudnorm --lufs -16   (-23 broadcast, -16 podcast)
-# scale all pauses: --gap-scale 1.2  (20% longer everywhere)
+# mastering: --loudnorm --lufs -16   (-23 broadcast, -16 podcast; --lufs has no
+#   effect unless --loudnorm is also passed)
+# scale all pauses: --gap-scale 1.2  (20% longer everywhere; overrides both the
+#   manifest's baked-in value AND voice.json if both are set)
 ```
 
 Trims each chunk's ragged edges, crossfades the seams (40 ms equal-power floor,
@@ -109,6 +169,11 @@ mastering (`--loudnorm`) uses **pyloudnorm** (EBU R128) with a true-peak guard.
 ffmpeg -i final.wav -filter:a "atempo=0.85" final_slow.wav   # pitch preserved
 ```
 
+**Candidate selection.** If you generated multiple takes per chunk (Stage 2's
+interactive `cand` command), drop a `selection.json` (`{"3": 2, "4": 1}`,
+chunk id → chosen version) in `--run-dir` and it's picked up automatically, or
+point at one explicitly with `--selection`.
+
 ## Notes
 
 - **Stage 1 is the only part that needs Portkey / an LLM.** Stages 2–3 are local
@@ -116,6 +181,6 @@ ffmpeg -i final.wav -filter:a "atempo=0.85" final_slow.wav   # pitch preserved
 - **Resume generation** with `--start-at N` if a long run is interrupted; the
   manifest still records every chunk's gap so the stitcher has the full pattern.
 - **The LoRA loader** reads the checkpoint's own `lora_config.json` to match the
-  trained rank (r=32) — same fix as `scripts/05_infer.py`. Don't let it default.
+  trained rank. Don't let it default.
 - **Control tags nudge, they don't command** — per the research, their effect on
   pace is real but stochastic. The chunking and pauses do the heavy lifting.

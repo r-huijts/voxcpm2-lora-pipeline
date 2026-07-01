@@ -2,7 +2,7 @@
 """
 03_stitch.py — Concatenate generated chunks with natural pauses.
 
-Reads the manifest.json written by 02_generate.py and joins the chunk wavs in
+Reads the manifest.json written by 02_generate_nanovllm.py and joins the chunk wavs in
 order, inserting silence at each break:
   - "short" gap  -> short pause (within a paragraph)
   - "long"  gap  -> longer pause (between paragraphs)
@@ -46,6 +46,8 @@ from pathlib import Path
 
 import numpy as np
 import soundfile as sf
+
+from _pipeline_config import load_voice_config, apply_config_defaults
 
 
 def trim_silence(audio: np.ndarray, sr: int, thresh_db: float = -40.0,
@@ -130,7 +132,7 @@ def resolve_chunk_file(run_dir: Path, item: dict, selection: dict) -> Path:
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--run-dir", required=True, type=Path,
-                    help="Dir with chunk wavs + manifest.json from 02_generate.")
+                    help="Dir with chunk wavs + manifest.json from 02_generate_nanovllm.py.")
     ap.add_argument("--output", required=True, type=Path)
     ap.add_argument("--gap-scale", type=float, default=None,
                     help="Global multiplier on all per-chunk gaps "
@@ -149,7 +151,24 @@ def main():
                          "chunk, uses chunk_NNNN_vK.wav when a pick exists, else "
                          "falls back to the plain chunk_NNNN.wav. Defaults to "
                          "selection.json in --run-dir if present.")
+
+    CONFIGURABLE = {"gap_scale", "crossfade_ms", "lufs"}
+    ap.add_argument("--config", type=Path, default=Path("voice.json"),
+                    help="Shared per-voice defaults JSON (see scripts/_pipeline_config.py "
+                         "and scripts/voice.example.json). Keys: gap_scale, crossfade_ms, "
+                         "lufs. CLI flags always override it; note that a gap_scale/"
+                         "crossfade_ms set here takes priority over the values baked "
+                         "into this run's manifest.json.")
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", type=Path, default=Path("voice.json"))
+    config = load_voice_config(pre.parse_known_args()[0].config)
+    apply_config_defaults(ap, config, CONFIGURABLE)
+
     args = ap.parse_args()
+
+    if args.lufs != -16.0 and not args.loudnorm:
+        print(f"WARNING: --lufs {args.lufs} has no effect without --loudnorm.",
+              file=sys.stderr)
 
     manifest_path = args.run_dir / "manifest.json"
     if not manifest_path.exists():

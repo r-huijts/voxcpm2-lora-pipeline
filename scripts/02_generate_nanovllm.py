@@ -2,8 +2,8 @@
 """
 02_generate_nanovllm.py — Generate one audio file per chunk from a reviewed plan.
 
-Drop-in replacement for 02_generate.py that uses nano-vllm-voxcpm instead of
-plain voxcpm. Key differences:
+Uses nano-vllm-voxcpm (a quantized serving backend) to generate audio for each
+chunk of a plan.json produced by 01_chunk.py. Highlights:
 
   VOICE SEED
     A short neutral Dutch sentence is synthesised once at startup using your
@@ -45,8 +45,7 @@ plain voxcpm. Key differences:
         save_file(torch.load('lora_weights.pt'), 'lora_weights.safetensors')"
 
   MANIFEST
-    Output manifest.json is identical to 02_generate.py — 03_stitch.py
-    works unchanged.
+    Output manifest.json is the format 03_stitch.py expects.
 
 Usage:
     python 02_generate_nanovllm.py \\
@@ -79,6 +78,8 @@ import sys
 import warnings
 from pathlib import Path
 
+from _pipeline_config import load_voice_config, apply_config_defaults
+
 # ── silence harmless third-party noise ─────────────────────────────────────
 # torch weight_norm deprecation, torchaudio TorchCodec-migration warnings, and
 # the nano-vllm "non-writable NumPy array" UserWarning are all cosmetic and do
@@ -110,7 +111,6 @@ def _ensure_nanovllm_patched() -> None:
            mode (enforce_eager=True) doesn't AttributeError before the
            enforce_eager short-circuit.
 
-    See patch_nanovllm.py for the standalone version + backups + --revert.
     """
     try:
         import importlib.util
@@ -533,8 +533,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--plan", required=True, type=Path)
-    ap.add_argument("--lora", required=True, type=Path)
-    ap.add_argument("--reference", required=True, type=Path)
+    lora_action = ap.add_argument("--lora", required=True, type=Path)
+    reference_action = ap.add_argument("--reference", required=True, type=Path)
     ap.add_argument("--reference-text", default="")
     ap.add_argument("--reference-text-file", type=Path, default=None)
     ap.add_argument("--out-dir", required=True, type=Path)
@@ -605,7 +605,33 @@ def main():
                          "'list' shows chunks, 'quit' exits. Pair with "
                          "--only-chunks to skip the initial full run.")
 
+    CONFIGURABLE = {"lora", "reference", "reference_text_file", "cfg", "timesteps",
+                     "temperature", "max_generate_length", "prosody_tail",
+                     "gpu_memory_utilization", "max_model_len", "reground",
+                     "reground_anchor_frames", "whisper_model", "wer_threshold",
+                     "max_retries"}
+    ap.add_argument("--config", type=Path, default=Path("voice.json"),
+                    help="Shared per-voice defaults JSON (see scripts/_pipeline_config.py "
+                         "and scripts/voice.example.json). Lets --lora/--reference/tuning "
+                         "flags be set once per project instead of retyped every run. "
+                         "CLI flags always override it.")
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", type=Path, default=Path("voice.json"))
+    config = load_voice_config(pre.parse_known_args()[0].config)
+    applied = apply_config_defaults(ap, config, CONFIGURABLE)
+    if "lora" in applied:
+        lora_action.required = False
+    if "reference" in applied:
+        reference_action.required = False
+
     args = ap.parse_args()
+
+    if not args.controllable and args.reground != "every":
+        print(f"WARNING: --reground {args.reground!r} is ignored in Hi-Fi mode "
+              f"(regrounding only applies with --controllable).", file=sys.stderr)
+    if args.reference_text.strip() and args.reference_text_file is not None:
+        print(f"NOTE: --reference-text-file ({args.reference_text_file}) overrides "
+              f"--reference-text.", file=sys.stderr)
 
     # Parse --only-chunks into a set of ints (or None for "all").
     only_chunks = None

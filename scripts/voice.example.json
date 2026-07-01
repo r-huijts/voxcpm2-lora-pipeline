@@ -1,0 +1,17 @@
+{
+  "_comment": "Copy to voice.json in the directory you run the pipeline from. CLI flags always override these values. Secrets (PORTKEY_API_KEY) do NOT go here -- keep those in .env.",
+
+  "lora": "/workspace/voxcpm_lora/checkpoints/lora/latest",
+  "reference": "/workspace/voxcpm_project/references/ref_voice.wav",
+  "reference_text_file": "/workspace/voxcpm_project/references/ref_voice.txt",
+
+  "gap_scale": 1.0,
+  "crossfade_ms": 40,
+
+  "cfg": 1.6,
+  "timesteps": 20,
+  "whisper_model": "base",
+  "wer_threshold": 0.15,
+
+  "lexicon": "scripts/lexicon.json"
+}

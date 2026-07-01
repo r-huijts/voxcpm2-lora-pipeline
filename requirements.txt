@@ -1,4 +1,4 @@
-# narrate/ pipeline dependencies
+# Narration pipeline dependencies (scripts/01_chunk.py -> 02_generate_nanovllm.py -> 03_stitch.py)
 
 # Stage 1 — chunk
 portkey-ai>=1.0.0        # LLM gateway client

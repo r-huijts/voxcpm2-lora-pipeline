@@ -1,8 +1,4 @@
 # --- Data & artifacts (never commit these) ---
-raw/
-clips/
-dataset/
-ab_test/
 checkpoints/
 logs/
 outputs/
@@ -20,6 +16,9 @@ pretrained_models/
 *.ckpt
 *.pth
 *.bin
+
+# Per-project narration config (real paths, not secrets) -- see scripts/voice.example.json
+voice.json
 
 # --- Python ---
 __pycache__/

@@ -31,10 +31,12 @@ from pathlib import Path
 import pysbd
 from portkey_ai import Portkey
 
+from _pipeline_config import load_voice_config, apply_config_defaults
+
 
 def _load_dotenv():
     """
-    Load KEY=VALUE lines from a .env file (repo root, then narrate/) into the
+    Load KEY=VALUE lines from a .env file (repo root, then scripts/) into the
     environment, without overwriting anything already set. Lets you keep
     PORTKEY_API_KEY in a gitignored .env instead of pasting it each run.
     """
@@ -68,7 +70,7 @@ def load_lexicon(path: Path | None) -> dict[str, str]:
         }
 
     Only CONFIRMED respellings belong here — entries you've verified by ear
-    (e.g. with 02_generate's --only-chunks on the affected chunk). A wrong
+    (e.g. with 02_generate_nanovllm.py's --only-chunks on the affected chunk). A wrong
     respelling can move the error rather than fix it, so this file is a record
     of wins, not guesses. Returns {} if no path or file is given.
     """
@@ -552,6 +554,17 @@ def main():
                          "is an error.")
     ap.add_argument("--no-lexicon", action="store_true", default=False,
                     help="Skip lexicon application even if lexicon.json exists.")
+
+    CONFIGURABLE = {"model", "config_id", "gap_scale", "crossfade_ms", "lexicon"}
+    ap.add_argument("--config", type=Path, default=Path("voice.json"),
+                    help="Shared per-voice defaults JSON (see scripts/_pipeline_config.py "
+                         "and scripts/voice.example.json). Keys: model, config_id, "
+                         "gap_scale, crossfade_ms, lexicon. CLI flags always override it.")
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", type=Path, default=Path("voice.json"))
+    config = load_voice_config(pre.parse_known_args()[0].config)
+    apply_config_defaults(ap, config, CONFIGURABLE)
+
     args = ap.parse_args()
 
     if not args.api_key:
@@ -622,7 +635,7 @@ def main():
         print("\nWarnings (review before generating):")
         for w in warnings:
             print(f"  - {w}")
-    print(f"\nReview and edit {args.output}, then run 02_generate.py.")
+    print(f"\nReview and edit {args.output}, then run 02_generate_nanovllm.py.")
 
 
 if __name__ == "__main__":
