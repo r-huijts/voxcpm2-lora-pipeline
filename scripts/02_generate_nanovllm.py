@@ -1086,7 +1086,7 @@ def main():
           f"--output {args.out_dir / 'final.wav'}")
 
     # ── interactive regeneration loop ──────────────────────────────────────
-    if args.interactive:
+    if interactive:
         import shlex
 
         def _carry_from_prev(prev_id: int) -> bytes | None:
@@ -1109,7 +1109,7 @@ def main():
             except Exception:
                 return None
 
-        def _regen(cid: int, cfg_v: float, temp_v: float):
+        def _regen(cid: int, cfg_v: float, temp_v: float, version: int | None = None):
             c = plan_lookup.get(cid)
             if c is None:
                 print(f"  no chunk with id {cid} in the plan.")
@@ -1135,7 +1135,8 @@ def main():
             else:
                 chunk_ref = ref_anchor_latents if prev_latents is None else prev_latents
 
-            print(f"  regen chunk {cid} @ cfg={cfg_v} temp={temp_v}: "
+            tag = f" v{version}" if version else ""
+            print(f"  regen chunk {cid}{tag} @ cfg={cfg_v} temp={temp_v}: "
                   f"{text[:50]}{'...' if len(text) > 50 else ''}")
             wav, wer, att, _tr = generate_with_retry(
                 server=server, text=target_text, prompt_id=prompt_id,
@@ -1146,10 +1147,22 @@ def main():
                 wer_threshold=args.wer_threshold, max_retries=args.max_retries,
                 sample_rate=sample_rate, wer_reference=clean_for_wer(target_text),
             )
-            outp = args.out_dir / f"chunk_{cid:04d}.wav"
+            if version is None:
+                outp = args.out_dir / f"chunk_{cid:04d}.wav"
+            else:
+                outp = args.out_dir / f"chunk_{cid:04d}_v{version}.wav"
             sf.write(outp, wav, sample_rate, subtype="PCM_16")
             wtxt = f" WER={wer*100:.1f}%" if wer >= 0 else ""
             print(f"  wrote {outp.name} ({len(wav)/sample_rate:.1f}s{wtxt})")
+
+        def _candidates(cid: int, k: int, cfg_v: float, temp_v: float):
+            """Generate k candidate versions of a chunk as _v1.._vk."""
+            print(f"  generating {k} candidates of chunk {cid} "
+                  f"@ cfg={cfg_v} temp={temp_v} ...")
+            for v in range(1, k + 1):
+                _regen(cid, cfg_v, temp_v, version=v)
+            print(f"  done. Listen to chunk_{cid:04d}_v1.. and record your pick "
+                  f"in selection.json (e.g. {{\"{cid}\": 2}}).")
 
         # Build/refresh the id->chunk lookup from the current plan.
         def _load_plan_lookup():
@@ -1162,6 +1175,8 @@ def main():
         print("INTERACTIVE MODE — model stays loaded.")
         print("  <id>                  regenerate that chunk")
         print("  <id> --cfg 1.7 --temp 0.9   with overrides")
+        print("  cand <id> <k>         generate k candidate versions (_v1.._vk)")
+        print("  cand <id> <k> --cfg 1.7 --temp 0.9   candidates with settings")
         print("  reload                re-read plan.json (after lexicon/plan edits)")
         print("  list                  show chunk ids + text starts")
         print("  quit                  exit")
@@ -1186,6 +1201,26 @@ def main():
                     t = plan_lookup[k]["text"]
                     print(f"  {k:3d}  {t[:60]}{'...' if len(t) > 60 else ''}")
                 continue
+            # candidate command: cand <id> <k> [--cfg X] [--temp Y]
+            if raw.startswith("cand"):
+                try:
+                    parts = shlex.split(raw)
+                    cid = int(parts[1])
+                    k = int(parts[2])
+                    cfg_v, temp_v = args.cfg, args.temperature
+                    i = 3
+                    while i < len(parts):
+                        if parts[i] == "--cfg" and i + 1 < len(parts):
+                            cfg_v = float(parts[i + 1]); i += 2
+                        elif parts[i] in ("--temp", "--temperature") and i + 1 < len(parts):
+                            temp_v = float(parts[i + 1]); i += 2
+                        else:
+                            i += 1
+                except (ValueError, IndexError):
+                    print("  usage: cand <id> <k> [--cfg X] [--temp Y]")
+                    continue
+                _candidates(cid, k, cfg_v, temp_v)
+                continue
             # parse: <id> [--cfg X] [--temp Y]
             try:
                 parts = shlex.split(raw)
@@ -1200,7 +1235,7 @@ def main():
                     else:
                         i += 1
             except (ValueError, IndexError):
-                print("  usage: <id> [--cfg X] [--temp Y] | reload | list | quit")
+                print("  usage: <id> [--cfg X] [--temp Y] | cand <id> <k> | reload | list | quit")
                 continue
             _regen(cid, cfg_v, temp_v)
 

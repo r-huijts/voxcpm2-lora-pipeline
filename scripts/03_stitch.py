@@ -13,6 +13,14 @@ are the ONLY pauses at the seams (the model sometimes leaves ragged edges).
 A short equal-power crossfade smooths each join. Optional final EBU R128
 loudness normalization.
 
+CANDIDATE SELECTION
+    If a selection.json is present in the run-dir (or passed via --selection),
+    it maps chunk id -> chosen candidate version, e.g. {"3": 2, "4": 1}. For a
+    chunk with a pick, chunk_NNNN_v<K>.wav is stitched instead of the plain
+    chunk_NNNN.wav. Chunks without a pick use the plain file as before. This
+    lets you generate several candidates per chunk (02's interactive `cand`
+    command), listen, and hand-pick the best of each for the final stitch.
+
 No global speed change is applied — by design. If you want to slow the whole
 thing, do it afterward with: ffmpeg -i final.wav -filter:a "atempo=0.85" out.wav
 
@@ -20,9 +28,13 @@ Usage:
     python 03_stitch.py --run-dir /workspace/narration/run01 \
         --output /workspace/narration/run01/final.wav
 
+    # with hand-picked candidates
+    python 03_stitch.py --run-dir ... --output final.wav \
+        --selection /workspace/narration/run01/selection.json
+
     # tune pauses (override manifest config), add loudness mastering
     python 03_stitch.py --run-dir ... --output final.wav \
-        --short-ms 200 --long-ms 600 --loudnorm --lufs -16
+        --gap-scale 0.85 --loudnorm --lufs -16
 
 Requires: numpy, soundfile. Optional: ffmpeg (for --loudnorm).
 """
@@ -94,6 +106,27 @@ def loudnorm(audio: np.ndarray, sr: int, lufs: float, tp: float = -1.0) -> np.nd
     return normalized.astype(np.float32)
 
 
+def resolve_chunk_file(run_dir: Path, item: dict, selection: dict) -> Path:
+    """
+    Decide which wav to use for a chunk. If the chunk id has a pick in the
+    selection map, use chunk_NNNN_v<K>.wav; otherwise the plain file from the
+    manifest. Falls back to the plain file if the selected candidate is missing.
+    """
+    plain = run_dir / item["file"]
+    cid = item.get("id")
+    if cid is None or cid not in selection:
+        return plain
+    version = selection[cid]
+    # Derive the versioned name from the manifest filename stem.
+    stem = Path(item["file"]).stem  # e.g. chunk_0003
+    cand = run_dir / f"{stem}_v{version}.wav"
+    if cand.exists():
+        return cand
+    print(f"  WARNING chunk {cid}: selected v{version} not found "
+          f"({cand.name}); falling back to {plain.name}")
+    return plain
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--run-dir", required=True, type=Path,
@@ -110,6 +143,12 @@ def main():
                     help="Apply final EBU R128 loudness normalization (ffmpeg).")
     ap.add_argument("--lufs", type=float, default=-16.0,
                     help="Target integrated loudness (-23 broadcast, -16 podcast).")
+    ap.add_argument("--selection", type=Path, default=None,
+                    help="Path to selection.json mapping chunk id -> chosen "
+                         "candidate version, e.g. {\"3\": 2, \"4\": 1}. For each "
+                         "chunk, uses chunk_NNNN_vK.wav when a pick exists, else "
+                         "falls back to the plain chunk_NNNN.wav. Defaults to "
+                         "selection.json in --run-dir if present.")
     args = ap.parse_args()
 
     manifest_path = args.run_dir / "manifest.json"
@@ -119,6 +158,22 @@ def main():
     items = manifest.get("items", [])
     if not items:
         sys.exit("Manifest has no items.")
+
+    # Load the candidate selection map, if any.
+    sel_path = args.selection
+    if sel_path is None:
+        default_sel = args.run_dir / "selection.json"
+        sel_path = default_sel if default_sel.exists() else None
+    selection = {}
+    if sel_path is not None:
+        if not sel_path.exists():
+            sys.exit(f"Selection file not found: {sel_path}")
+        raw_sel = json.loads(sel_path.read_text(encoding="utf-8"))
+        for k, v in raw_sel.items():
+            if str(k).startswith("_"):
+                continue  # allow comment keys
+            selection[int(k)] = int(v)
+        print(f"Selection loaded ({len(selection)} picks) from {sel_path.name}")
 
     cfg = manifest.get("config", {})
     gap_scale = args.gap_scale if args.gap_scale is not None else cfg.get("gap_scale", 1.0)
@@ -131,7 +186,7 @@ def main():
     sr = None
 
     for item in items:
-        wav_path = args.run_dir / item["file"]
+        wav_path = resolve_chunk_file(args.run_dir, item, selection)
         if not wav_path.exists():
             sys.exit(f"Missing chunk audio: {wav_path}")
         audio, file_sr = sf.read(wav_path, dtype="float32")
