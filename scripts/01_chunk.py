@@ -136,7 +136,21 @@ uitgesproken. Regels:
      sfeer neerzetten (bv. "Rome. De Eeuwige Stad. Je loopt er rond…") \
      horen bij elkaar in één fragment — ook al zijn het meerdere zinnen.
 
-  f. Gebruik je oor: waar zou een verteller ademhalen? Dáár is de grens.
+  f. AFSLUITERS NOOIT ISOLEREN — een kort, afsluitend fragment (een dalende \
+     slotzin, een groet, een sign-off zoals "Bon courage." of "Tot morgen.", \
+     een korte terugblik aan het einde van een gedachte) mag NOOIT als eigen \
+     fragment staan. Voeg het ALTIJD samen met het VOORAFGAANDE fragment, \
+     zodat de slotzin meelift op de aanloop van een langere generatie. \
+     Reden: de TTS-stem stopt vroegtijdig wanneer een kort fragment met een \
+     dalende, "afgeronde" cadans op zichzelf staat — de stem "denkt" dat het \
+     klaar is en kapt de zin af. Een afsluiter die achter de voorafgaande \
+     zin hangt, wordt wél volledig uitgesproken. Dit geldt in het bijzonder \
+     voor het ALLERLAATSTE fragment van de hele tekst: dat is nooit een losse \
+     korte slotzin, maar hangt aan de zin ervoor. Een lange slotzin (meer dan \
+     ~twaalf woorden) mag wel op zichzelf staan; het risico geldt alleen \
+     korte afsluiters.
+
+  g. Gebruik je oor: waar zou een verteller ademhalen? Dáár is de grens.
 
 ════════════════════════════════════════════════════════
 STAP 3 — POSITIE in de gedachtegang
