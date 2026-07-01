@@ -1086,7 +1086,7 @@ def main():
           f"--output {args.out_dir / 'final.wav'}")
 
     # ── interactive regeneration loop ──────────────────────────────────────
-    if interactive:
+    if args.interactive:
         import shlex
 
         def _carry_from_prev(prev_id: int) -> bytes | None:
