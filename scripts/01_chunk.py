@@ -56,6 +56,73 @@ def _load_dotenv():
 _load_dotenv()
 
 
+def load_lexicon(path: Path | None) -> dict[str, str]:
+    """
+    Load a pronunciation lexicon: a flat JSON object mapping the original word
+    (as it appears in the column) to a phonetic respelling that the TTS voice
+    pronounces correctly. Example:
+
+        {
+          "klassementsman": "klassements-man",
+          "Roglič": "Roglietsj"
+        }
+
+    Only CONFIRMED respellings belong here — entries you've verified by ear
+    (e.g. with 02_generate's --only-chunks on the affected chunk). A wrong
+    respelling can move the error rather than fix it, so this file is a record
+    of wins, not guesses. Returns {} if no path or file is given.
+    """
+    if path is None:
+        return {}
+    if not path.exists():
+        sys.exit(f"Lexicon file not found: {path}")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        sys.exit(f"Lexicon is not valid JSON: {e}")
+    if not isinstance(data, dict):
+        sys.exit("Lexicon must be a JSON object of {original: respelling}.")
+    # Coerce values to str; drop empty keys and underscore-prefixed comment keys
+    # (e.g. "_comment") so notes can live in the file without being applied.
+    return {str(k): str(v) for k, v in data.items()
+            if str(k).strip() and not str(k).startswith("_")}
+
+
+def apply_lexicon(text: str, lexicon: dict[str, str]) -> tuple[str, list[tuple[str, str, int]]]:
+    """
+    Apply the lexicon to the raw column text with whole-word, case-sensitive
+    replacement, BEFORE sentence splitting and the LLM call — so the LLM and the
+    TTS only ever see the respelled form.
+
+    Whole-word means the match is bounded by non-letter characters (Unicode
+    aware, so accented names like Pogačar are matched as whole words and inner
+    accents are preserved). Longer keys are applied first so a multi-word key
+    isn't pre-empted by a shorter overlapping one.
+
+    Returns (new_text, applied) where applied is a list of
+    (original, respelling, count) for the ones that actually fired — so the
+    caller can report what changed.
+    """
+    if not lexicon:
+        return text, []
+    applied = []
+    # Apply longer keys first (handles multi-word names before their parts).
+    for original in sorted(lexicon, key=len, reverse=True):
+        respelling = lexicon[original]
+        # Word boundary via lookarounds that treat any non-letter (incl. start/
+        # end of string, spaces, punctuation) as a boundary. \w is ASCII-biased,
+        # so use an explicit letter class with Unicode.
+        pattern = re.compile(
+            r"(?<![^\W\d_])" + re.escape(original) + r"(?![^\W\d_])",
+            flags=re.UNICODE,
+        )
+        new_text, n = pattern.subn(respelling, text)
+        if n > 0:
+            applied.append((original, respelling, n))
+            text = new_text
+    return text, applied
+
+
 def split_sentences(column: str) -> list[dict]:
     """
     Deterministically split the column into sentences with pySBD (Dutch),
@@ -476,6 +543,15 @@ def main():
                          "(1.2 = 20%% longer pauses everywhere).")
     ap.add_argument("--crossfade-ms", type=int, default=40,
                     help="Crossfade floor at every seam, even zero-gap ones.")
+    ap.add_argument("--lexicon", type=Path,
+                    default=Path(__file__).resolve().parent / "lexicon.json",
+                    help="Pronunciation lexicon JSON ({original: respelling}), "
+                         "applied to the column before chunking. Defaults to "
+                         "lexicon.json next to this script. Missing default file "
+                         "is silently skipped; an explicitly-passed missing file "
+                         "is an error.")
+    ap.add_argument("--no-lexicon", action="store_true", default=False,
+                    help="Skip lexicon application even if lexicon.json exists.")
     args = ap.parse_args()
 
     if not args.api_key:
@@ -486,6 +562,26 @@ def main():
     column = args.input.read_text(encoding="utf-8").strip()
     if not column:
         sys.exit("Input file is empty.")
+
+    # Apply the pronunciation lexicon BEFORE splitting/LLM, so the respelled
+    # forms flow through untouched. Default file may not exist yet — that's fine.
+    if not args.no_lexicon:
+        lex_path = args.lexicon
+        lexicon = {}
+        if lex_path.exists():
+            lexicon = load_lexicon(lex_path)
+        elif args.lexicon != (Path(__file__).resolve().parent / "lexicon.json"):
+            # Explicitly-passed path that doesn't exist → error (load_lexicon exits).
+            lexicon = load_lexicon(lex_path)
+        if lexicon:
+            column, applied = apply_lexicon(column, lexicon)
+            if applied:
+                print(f"Lexicon applied ({lex_path.name}):")
+                for original, respelling, n in applied:
+                    print(f"  {original!r} → {respelling!r}  ×{n}")
+            else:
+                print(f"Lexicon loaded ({len(lexicon)} entries) — "
+                      f"no matches in this column.")
 
     # Deterministic sentence split first (pySBD, Dutch) — the LLM groups these.
     rows = split_sentences(column)

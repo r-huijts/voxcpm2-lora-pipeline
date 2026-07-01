@@ -1,0 +1,4 @@
+{
+  "_comment": "Pronunciation lexicon: original -> respelling. ONLY add entries you have VERIFIED by ear (regenerate the affected chunk with 02_generate --only-chunks and confirm the respelling actually helps). A wrong respelling can MOVE the error rather than fix it (e.g. Roglic->Roglitsj was heard as 'roglitsjie'). Whole-word, case-sensitive. Delete this _comment key or leave it — non-matching keys are harmless.",
+  "klassementsman": "klassements-man"
+}
