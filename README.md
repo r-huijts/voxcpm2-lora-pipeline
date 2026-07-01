@@ -1,24 +1,34 @@
 # voxcpm2-lora-pipeline — long-form voice narration
 
-Turns a plain-text column into a finished narration audio file, spoken in a
-specific cloned voice (currently: Mart Smeets). It's built on
-[VoxCPM2](https://github.com/OpenBMB/VoxCPM), a voice-cloning TTS model, using
-a LoRA fine-tuned on that voice's recordings for timbre, plus an LLM-driven
-chunking step for natural pacing. Three stages, run on a GPU pod (see
-Pipeline below for the full diagram).
+**The problem:** making a written column sound like it's actually being read
+aloud by a specific person — at full article length — is harder than it
+looks. A generic TTS voice doesn't sound like anyone in particular. Feed a
+whole article to VoxCPM2 (or most long-form TTS models) in one shot and it
+"rushes" — pace and timbre drift over the length of the piece. Names and
+numbers get mispronounced. And a single giant block of text throws away
+everything that makes spoken delivery sound human: pacing, breath, the shape
+of a sentence building to a punchline.
 
-The LoRA itself is trained separately, once per voice, outside this repo —
-here you only need a finished checkpoint (see Requirements below).
+**What this pipeline does about it:**
+- **Clones a specific voice with a LoRA** (currently: Mart Smeets) — real
+  identity, not just a reference-clip approximation.
+- **Has an LLM read the whole column first** and split it into variable-size
+  "delivery units" — complete spoken thoughts — instead of fixed-size chunks.
+  Each chunk stays short enough that VoxCPM2 never has room to drift, while
+  short punches that land together stay together and long builds stay whole.
+- **Respells hard names and numbers** before they're ever spoken, so
+  pronunciation doesn't degrade cloning quality.
+- **Inserts pauses at stitch time** — short within a paragraph, longer between
+  them, sized to the rhetorical weight of each break — instead of asking the
+  model to generate silence.
 
-The design principle: **variable-size chunks decided by an LLM that reads the
-whole column**, not fixed rules. Each chunk is one "delivery unit" — a complete
-spoken thought. Short punches that land together stay together; long builds stay
-whole; numbers and hard names are respelled for correct pronunciation. Pauses are
-inserted at stitch time (short within a paragraph, long between paragraphs), so
-the model never has to generate silence.
+The voice is swappable: point a different LoRA checkpoint + reference clip at
+it (see Requirements) and it narrates written text in a different cloned
+voice using the same mechanism.
 
-Why not one long generation: VoxCPM2 accelerates ("rushes") on long single-shot
-text. Chunking removes that at the source — each chunk is too short to drift.
+Three stages, run on a GPU pod (see Pipeline below for the full diagram). The
+LoRA itself is trained separately, once per voice, outside this repo — here
+you only need a finished checkpoint.
 
 ## Requirements
 
