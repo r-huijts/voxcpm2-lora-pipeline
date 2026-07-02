@@ -10,8 +10,8 @@ everything that makes spoken delivery sound human: pacing, breath, the shape
 of a sentence building to a punchline.
 
 **What this pipeline does about it:**
-- **Clones a specific voice with a LoRA** real
-  identity, not just a reference-clip approximation.
+- **Clones a specific voice with a LoRA** — real identity, not just a
+  reference-clip approximation.
 - **Has an LLM read the whole column first** and split it into variable-size
   "delivery units" — complete spoken thoughts — instead of fixed-size chunks.
   Each chunk stays short enough that VoxCPM2 never has room to drift, while
@@ -47,7 +47,8 @@ you only need a finished checkpoint.
 
 ```
 column.txt
-   │  01_chunk.py            (LLM via Portkey: chunk + respell + tag + gap)
+   │  01_chunk.py            (LLM via Portkey: group + position + control + gap;
+   │                          script builds source_text/spoken_text deterministically)
    ▼
 plan.json   ← YOU REVIEW AND EDIT THIS
    │  02_generate_nanovllm.py   (LoRA, reference re-anchor + ASR quality gate per chunk)
@@ -85,6 +86,33 @@ Both accept an explicit `--no-controllable` / `--no-loudnorm` on the command
 line to force them off for a single run even when `voice.json` sets them
 `true`.
 
+## Cloning a real person's voice: ship generic, override locally
+
+`01_chunk.py`'s LLM prompt describes a delivery *style* (a `(stijl: ...)`
+persona descriptor), not a name — the committed default is a generic,
+safe-to-share profile:
+
+> veteran Dutch public-broadcast cycling columnist: dry, measured, restrained,
+> lightly ironic; precision over pathos, irony in the timing
+
+If you're cloning a specific real person's voice, override this **locally,
+never in a committed file** — the VoxCPM2 model card warns against shipping
+generation instructions that name a real person. Two equivalent ways, in
+priority order (`--style-profile` flag beats both):
+
+```bash
+# 1. voice.json (gitignored) -- the recommended way, alongside your other
+#    per-project settings:
+{"style_profile": "your real descriptor here"}
+
+# 2. NARRATE_STYLE_PROFILE in .env (also gitignored):
+echo 'NARRATE_STYLE_PROFILE=your real descriptor here' >> .env
+```
+
+`03_stitch.py` also notes in its console output that the result is
+AI-generated (provenance documentation, not an audio watermark) — on by
+default, disable with `--no-label-ai-generated` or `NARRATE_LABEL_AI_GENERATED=0`.
+
 ## Stage 1 — chunk (LLM)
 
 ```bash
@@ -106,16 +134,22 @@ Two steps inside Stage 1:
 1. **pySBD** splits the column into sentences deterministically (Dutch, rule-based,
    handles abbreviations/numbers). The LLM does NOT find sentence boundaries —
    that's the part LLMs occasionally botch.
-2. The **LLM groups** those clean sentences into delivery units, respells
-   numbers/names, and tags cadence + gaps.
+2. The **LLM makes structural decisions only** — which sentences group into a
+   delivery unit, its position in the thought-arc, its control tag, its pause.
+   It does **not** write the spoken text. An LLM asked to reproduce text
+   verbatim while also editing it (grouping, expanding numbers) can silently
+   paraphrase or drop a clause, undetectable by an ID-coverage check alone —
+   so the SCRIPT builds the wording itself from the raw sentences instead.
 
 The script then runs a **coverage check**: every pySBD sentence must appear in
-exactly one chunk. If the LLM drops or duplicates a sentence while grouping, you
-get a warning before generating — not a hole in the audio.
+exactly one chunk, AND a self-check that concatenating every chunk's
+`source_text` reproduces the original column exactly (this catches bugs in the
+script's own chunk-building, since the LLM never touches wording at all).
 
 Produces `plan.json`. Each chunk carries:
 - `position`: `opening` | `continuing` | `final` — the chunk's role in the
-  thought-arc. This drives everything else.
+  thought-arc. Drives the control tag, the stitch-time gap defaults, and (in
+  Stage 2) whether prosody carries over from the previous chunk.
 - `control`: style **plus an intonation hint** derived from position — a `final`
   chunk gets a falling close ("dalende afsluiting"), a `continuing` chunk is told
   not to resolve ("doorlopend, niet afsluiten"). Targets the "every chunk sounds
@@ -125,15 +159,46 @@ Produces `plan.json`. Each chunk carries:
   end, 600-900 before a punchline.
 - `sentences`: the pySBD sentence IDs grouped into this chunk (for the coverage
   check).
+- `source_text`: the original sentences, verbatim — the audit reference, never
+  touched by the lexicon or number normalization.
+- `spoken_text`: `source_text` run through the lexicon then `normalize_dutch()`
+  (deterministic, conservative — numbers/times/years/percentages/abbreviations
+  are expanded only where unambiguous; alphanumeric codes and thousands-grouped
+  numbers are left alone rather than guessed). This is what Stage 2 generates.
+- `carryover_after` (optional, you add it by hand): overrides Stage 2's default
+  rule for whether this chunk's prosody carries into the next one — see Stage 2.
 
-**Review it.** The `position` field makes the LLM's judgment inspectable — you can
-see at a glance which chunks it thinks resolve vs. flow, and correct that directly.
-Editing a pause is just changing the `gap_after_ms` integer.
+**Review `spoken_text`** — that's what gets spoken. The `position` field makes
+the LLM's structural judgment inspectable; editing a pause is just changing the
+`gap_after_ms` integer.
 
 **Pronunciation lexicon.** `scripts/lexicon.json` holds CONFIRMED respellings
 (`{"klassementsman": "klassements-man"}`) applied to the column before chunking.
 Only add entries you've verified by ear — a wrong respelling can move the error
 rather than fix it. Skip it entirely with `--no-lexicon`.
+
+**Screening respelling candidates before spending a generation cycle.**
+`scripts/lexicon_prefilter.py` is a standalone, optional diagnostic tool — not
+wired into the pipeline — that checks whether a candidate respelling produces
+a *sane phoneme sequence* via espeak-ng, before you burn a GPU cycle testing
+it:
+
+```bash
+python scripts/lexicon_prefilter.py --word klassementsman \
+    --candidates "klassements-man" "klassemensman" "klassement man"
+```
+
+It catches consonant-cluster collapse and gross garbage — the
+"klassementsman" → "klassemensman" class of bug — cheaply and offline. **It
+does not catch stress/emphasis placement**: espeak-ng's stress model isn't
+VoxCPM's, so a candidate can pass this filter cleanly and still land with
+wrong emphasis. Stress-focused respellings still go straight to the ear test.
+This is a coarse net for a cheap, common failure mode, not a pronunciation
+oracle — **ear verification via `--only-chunks` in `02_generate_nanovllm.py`
+remains mandatory** before any candidate goes into `lexicon.json`. Requires
+`espeak-ng` + `phonemizer` (see `requirements.txt`); without them every
+candidate is flagged `espeak_unavailable` and left in its original order —
+the rest of the pipeline is unaffected either way.
 
 ## Stage 2 — generate
 
@@ -153,10 +218,31 @@ Cloning instead — the LoRA gives the voice, the reference clip is re-anchored
 each chunk to fight drift (`--reground`), and the per-chunk control tag steers
 cadence. Writes `chunk_0001.wav ...` and `manifest.json`.
 
+**Prosody carry-over is suppressed at rhetorical boundaries.** By default each
+chunk inherits a short prosody tail from the previous one for continuity, but
+that's turned off when the previous chunk's `position` is `final` (its falling
+cadence shouldn't bleed into what follows) or the current chunk's is `opening`
+(a fresh thought shouldn't inherit the prior one's prosody) — in Controllable
+mode with regrounding this only drops the tail, the voice anchor stays. Force
+either way for one transition with the previous chunk's `carryover_after: true
+/ false` in `plan.json`.
+
 **ASR quality gate.** After each chunk, faster-whisper transcribes it and jiwer
 scores Word Error Rate against the intended text; chunks over `--wer-threshold`
 (default 0.15) are regenerated up to `--max-retries` times and the best attempt
 is kept. Disable with `--no-asr`.
+
+**Duration-ratio gate.** WER checks words, not delivery — a chunk can score
+perfect WER while rushed, truncated, or "runaway" (VoxCPM's documented
+never-stops failure mode, which otherwise silently fills VRAM). Each attempt's
+audio length is checked against `words × target seconds-per-word`, as a RATIO
+(never an absolute threshold): under `--duration-floor` (default 0.5×) is
+rushed/truncated, over `--runaway-ratio` (default 2.0×) is a suspected runaway —
+both retry like the WER gate, logged to `wer_log.json` alongside WER. The
+per-voice pace target starts at a conservative built-in default and switches to
+the running median of accepted chunks after `--baseline-min-chunks` (default 5);
+override it directly with `--sec-per-word-target`. Disable entirely with
+`--no-duration-gate`.
 
 **Fixing individual chunks.** `--only-chunks 4,7` regenerates just those chunk
 IDs in an existing `--out-dir`, leaving the rest untouched. `--interactive`
@@ -200,6 +286,19 @@ ffmpeg -i final.wav -filter:a "atempo=0.85" final_slow.wav   # pitch preserved
 interactive `cand` command), drop a `selection.json` (`{"3": 2, "4": 1}`,
 chunk id → chosen version) in `--run-dir` and it's picked up automatically, or
 point at one explicitly with `--selection`.
+
+**Every stitch also writes:**
+- `timeline.json` and `<output-stem>.srt`, next to `--output` — sample-accurate
+  start/end/duration/gap for every chunk in the final audio (accounts for trim
+  + crossfade overlap, not naive nominal lengths — a targeted regen from a
+  timecode you heard a problem at starts here), and one subtitle cue per
+  chunk from the same timeline, captioned with the chunk's original
+  (pre-normalization) wording.
+- `run_report.txt` / `.json`, in `--run-dir` — a QA sheet combining the
+  timeline with `wer_log.json` (WER, pace, retries, duration-gate pass/fail,
+  RUNAWAY flags) and any candidate picks — one glanceable table instead of
+  three separate files. Regenerates every time you re-stitch, e.g. after
+  updating `selection.json`.
 
 ## Notes
 

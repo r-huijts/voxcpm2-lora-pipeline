@@ -4,10 +4,24 @@
 
 An LLM (via Portkey) reads the WHOLE column first, decides the overall delivery
 register, then splits it into "delivery units" — spans spoken as one continuous
-breath. For each chunk it returns:
-  - text:    the chunk, with numbers expanded and (sparingly) non-verbal tags
-  - control: a per-chunk style/pace tag, chosen against the whole arc
-  - gap_after: "short" (within paragraph) | "long" (between paragraphs) | "none" (last)
+breath. The LLM makes STRUCTURAL decisions only: for each chunk it returns
+  - sentences: which P#S# sentence IDs belong to this delivery unit
+  - position:  "opening" | "continuing" | "final" in the thought-arc
+  - control:   a per-chunk style/pace tag, chosen against the whole arc
+  - gap_after_ms: the pause after this chunk, in milliseconds
+
+The LLM does NOT write the spoken text. This is deliberate: an LLM asked to
+reproduce text verbatim while also editing it (grouping, expanding numbers,
+inserting tags) can silently paraphrase, drop a clause, or "improve" a
+sentence -- undetectable by a coverage check that only verifies sentence IDs.
+Instead, the SCRIPT builds two fields per chunk from the RAW pySBD sentences,
+after the LLM has only chosen which IDs go together:
+  - source_text:  the original sentences verbatim, byte-for-byte from the
+                   pySBD split -- the audit reference, never touched by the
+                   lexicon or normalization.
+  - spoken_text:  source_text run through deterministic transforms (lexicon
+                   respellings, then normalize_dutch() for numbers/
+                   abbreviations) -- what actually gets generated.
 
 The output JSON is meant to be EDITED by hand before generation. Nothing is
 final until you've read it.
@@ -18,8 +32,8 @@ Usage:
     python 01_chunk.py --input column.txt --output plan.json \
         --model gpt-4o --config-id pc-xxxx
 
-Requires: portkey_ai
-    pip install portkey-ai
+Requires: portkey_ai, num2words
+    pip install portkey-ai num2words
 """
 import argparse
 import json
@@ -32,6 +46,7 @@ import pysbd
 from portkey_ai import Portkey
 
 from _pipeline_config import load_voice_config, apply_config_defaults
+from _dutch_numbers import normalize_dutch
 
 
 def _load_dotenv():
@@ -146,6 +161,21 @@ def split_sentences(column: str) -> list[dict]:
     return rows
 
 
+def sentence_lookup(rows: list[dict]) -> dict[str, dict]:
+    """Map 'P#S#' ID -> its row (raw text + natural order), for building
+    source_text straight from the RAW pySBD split -- never from LLM output."""
+    return {f"P{r['para']}S{r['sent']}": {**r, "_order": i} for i, r in enumerate(rows)}
+
+
+def build_source_text(sentence_ids: list[str], lookup: dict[str, dict]) -> str:
+    """Join the raw sentences for these IDs verbatim, in natural (para, sent)
+    order regardless of the order the LLM listed them in. IDs unknown to the
+    lookup are skipped (the coverage check separately flags unknown IDs)."""
+    known = [lookup[sid] for sid in sentence_ids if sid in lookup]
+    known.sort(key=lambda r: r["_order"])
+    return " ".join(r["text"] for r in known)
+
+
 def format_sentences_for_llm(rows: list[dict]) -> str:
     """Render the numbered sentence list the LLM will group."""
     lines = []
@@ -158,16 +188,33 @@ def format_sentences_for_llm(rows: list[dict]) -> str:
     return "\n".join(lines).strip()
 
 
-SYSTEM_PROMPT = """\
+# Generic, safe-to-commit style profile. The VoxCPM2 model card warns against
+# using a real person's identity in generation instructions; a project that
+# clones a specific real voice should override this locally (never commit the
+# override) via, in priority order: the --style-profile flag, a "style_profile"
+# key in voice.json (gitignored), the NARRATE_STYLE_PROFILE env var (settable
+# via the gitignored .env), or this shipped default.
+GENERIC_STYLE_PROFILE = (
+    "veteran Dutch public-broadcast cycling columnist: dry, measured, "
+    "restrained, lightly ironic; precision over pathos, irony in the timing"
+)
+
+
+def default_style_profile() -> str:
+    return os.environ.get("NARRATE_STYLE_PROFILE", GENERIC_STYLE_PROFILE)
+
+
+SYSTEM_PROMPT_TEMPLATE = """\
 
 Je bent een audioregisseur die een Nederlandse column voorbereidt voor \
 tekst-naar-spraak synthese met een gekloonde stem \
-(stijl: Mart Smeets — droog, zakelijk wielercommentaar; weinig pathos, \
-veel precisie, ironie zit in de timing).
+(stijl: __STYLE_PROFILE__).
 
 Je krijgt de column als een lijst van genummerde zinnen (P<alinea>S<zin>). \
-De zinsgrenzen staan VAST. Jouw taak is de zinnen GROEPEREN tot \
-"delivery units" en de tekst voorbereiden voor uitspraak.
+De zinsgrenzen staan VAST. Jouw taak is uitsluitend STRUCTUREEL: de zinnen \
+GROEPEREN tot "delivery units", en per unit de positie, control instruction \
+en pauze bepalen. Je herschrijft, normaliseert of respelt de tekst zelf NIET \
+— dat gebeurt na jouw output, deterministisch, door het script.
 
 ════════════════════════════════════════════════════════
 STAP 1 — LEES HET GEHEEL
@@ -289,79 +336,7 @@ afsluiting en rust uitdrukt (bv. "slow, dry, settled, heavy").
 Geen uitzonderingen.
 
 ════════════════════════════════════════════════════════
-STAP 5 — NON-VERBALE TAGS (zeer spaarzaam)
-════════════════════════════════════════════════════════
-Je mag — uitsluitend waar de tekst het echt verdient — een non-verbale tag
-inline in de fragmenttekst plaatsen. De TTS-stem zet deze tags om in een
-hoorbaar, niet-talig geluid (een ademhaling, een korte lach, een zucht).
-
-SYNTAX:
-  - Engelstalige tag, tussen rechte haken, kleine letters: [zucht] wordt
-    NIET gebruikt — gebruik de Engelse vorm. Toegestane tags:
-        [sigh]        — een korte, droge zucht
-        [breath]      — een hoorbare ademhaling vóór een nieuwe gedachte
-        [laugh]       — een korte, ingehouden lach (zelden)
-        [exhale]      — een uitademing, berusting
-  - Plaats de tag exact op de positie in de tekst waar het geluid hoort,
-    niet aan het begin van het fragment als een soort label.
-        Goed:  "Hij won. [exhale] Natuurlijk won hij."
-        Fout:  "[sigh] Hij won opnieuw zonder enige tegenstand."
-        (de tweede plaatst de tag mechanisch vooraan; dat klinkt onecht)
-
-IJZEREN REGELS — overtreed deze nooit:
-  1. MAXIMAAL één tag per fragment. Liever geen.
-  2. De meeste fragmenten krijgen GEEN tag. Een hele column met drie of
-     vier tags in totaal is ruim voldoende. Tags zijn een schaars
-     kruidmiddel, geen vaste ingrediënt.
-  3. Gebruik een tag alleen als het non-verbale geluid betekenis draagt:
-     een droge zucht ná een voorspelbare overwinning, een ademhaling vóór
-     een wending. Nooit ter decoratie.
-  4. Stapel nooit tags ([sigh][breath]) en zet nooit twee tags in één zin.
-  5. Bij twijfel: GEEN tag. De ironie zit in de woorden en de timing; het
-     non-verbale geluid is slechts een zeldzame, welbewuste onderstreping.
-  6. Kleine letters, exact zoals hierboven gespeld. Geen varianten als
-     [Sigh], [laughter], [sighs].
-
-Plaats de tags terwijl je STAP 5 (normalisatie) uitvoert, in dezelfde
-fragmenttekst. De tag telt niet mee als "los cijfer" of als naam — het is
-gewoon onderdeel van de uitspreektekst.
-
-════════════════════════════════════════════════════════
-STAP 6 — NORMALISEER de tekst voor uitspraak
-════════════════════════════════════════════════════════
-Schrijf de tekst van elk fragment uitspreekvriendelijk:
-
-  GETALLEN — schrijf altijd voluit in het Nederlands:
-    • Kardinaal:   "214"    → "tweehonderdveertien"
-    • Decimaal:    "420,3"  → "vierhonderdtwintig komma drie"
-    • Ordinals:    "1e"     → "eerste", "3e" → "derde"
-    • Tijden:      "14:30"  → "veertien uur dertig"
-    • Jaren:       "2026"   → "tweeduizend zesentwintig"
-    • Procenten:   "8%"     → "acht procent"
-    • Snelheid:    "45 km/u"→ "vijfenveertig kilometer per uur"
-
-  AFKORTINGEN — schrijf voluit of spel letter voor letter:
-    • "UCI"  → "U-C-I"
-    • "ASO"  → "A-S-O"
-    • "nr."  → "nummer"
-    • "ca."  → "circa"
-    • "bv."  → "bijvoorbeeld"
-    • "km"   → "kilometer" (wanneer als maatstaf gebruikt)
-
-  EIGENNAMEN — laat ONGEWIJZIGD. Schrijf namen precies zoals ze in \
-  de originele tekst staan. Geen fonetische herspelling.
-
-  OVERIG:
-    • Gewone Nederlandse woorden: ongemoeid laten.
-    • Begint een fragment na normalisatie met een uitgeschreven getal: \
-      zet een hoofdletter op het eerste woord.
-    • Na normalisatie mogen er GEEN losse cijfers (0–9) meer in de tekst \
-      staan. Controleer dit expliciet.
-  VASTE VERVANGINGEN: 
-    "Phoenix Poule" → "Phoenix Poel"
-
-════════════════════════════════════════════════════════
-STAP 7 — GAP AFTER (ms)
+STAP 5 — GAP AFTER (ms)
 ════════════════════════════════════════════════════════
 De stilte NA dit fragment, in milliseconden.
 
@@ -392,7 +367,6 @@ UITVOER — uitsluitend geldige JSON, geen uitleg, geen markdown
     {
       "id": 1,
       "sentences": ["P1S1", "P1S2"],
-      "text": "<genormaliseerde uitspraakvriendelijke tekst, eventueel met max één non-verbale tag>",
       "position": "opening",
       "control": "<Engelse control instruction voor dit fragment>",
       "gap_after_ms": 300
@@ -400,8 +374,17 @@ UITVOER — uitsluitend geldige JSON, geen uitleg, geen markdown
   ]
 }
 
+Geef GEEN "text"-veld terug — de tekst wordt door het script zelf opgebouwd
+uit de originele zinnen, exact zoals aangeleverd. Jouw taak is uitsluitend
+groeperen (sentences), positioneren (position), de control instruction en
+de pauze (gap_after_ms).
+
 Zorg dat elke zin-ID exact één keer voorkomt over alle chunks.
 """
+
+
+def build_system_prompt(style_profile: str) -> str:
+    return SYSTEM_PROMPT_TEMPLATE.replace("__STYLE_PROFILE__", style_profile)
 
 
 def build_client(api_key: str, config_id: str | None) -> Portkey:
@@ -411,10 +394,10 @@ def build_client(api_key: str, config_id: str | None) -> Portkey:
     return Portkey(**kwargs)
 
 
-def call_llm(client: Portkey, model: str, sentences_block: str) -> str:
+def call_llm(client: Portkey, model: str, sentences_block: str, style_profile: str) -> str:
     """Single chat completion; returns raw assistant text."""
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": build_system_prompt(style_profile)},
         {"role": "user", "content": sentences_block},
     ]
     # max_tokens for most providers; some newer OpenAI models need
@@ -459,12 +442,8 @@ def parse_plan(raw: str) -> dict:
     return json.loads(text)
 
 
-# Allowed non-verbal tags. Anything in [brackets] not on this list is a warning.
-ALLOWED_TAGS = {"[sigh]", "[breath]", "[laugh]", "[exhale]"}
-_TAG_RE = re.compile(r"\[[^\]]+\]")
-
-
-def validate_plan(plan: dict, expected_sentence_ids: set[str] | None = None) -> list[str]:
+def validate_plan(plan: dict, expected_sentence_ids: set[str] | None = None,
+                   rows: list[dict] | None = None) -> list[str]:
     """Return a list of warnings (empty if clean). Non-fatal sanity checks."""
     warnings = []
     chunks = plan.get("chunks", [])
@@ -472,12 +451,10 @@ def validate_plan(plan: dict, expected_sentence_ids: set[str] | None = None) -> 
         warnings.append("No chunks returned.")
         return warnings
     valid_positions = {"opening", "continuing", "final"}
-    total_tags = 0
     for i, c in enumerate(chunks):
         cid = c.get("id", i + 1)
-        text = c.get("text", "")
-        if not text.strip():
-            warnings.append(f"Chunk {cid}: empty text.")
+        if not c.get("spoken_text", "").strip():
+            warnings.append(f"Chunk {cid}: empty spoken_text.")
         if not c.get("control", "").strip():
             warnings.append(f"Chunk {cid}: missing control tag.")
         if c.get("position") not in valid_positions:
@@ -489,28 +466,8 @@ def validate_plan(plan: dict, expected_sentence_ids: set[str] | None = None) -> 
         elif gap < 0 or gap > 3000:
             warnings.append(f"Chunk {cid}: gap_after_ms={gap} out of sane "
                             f"range (0-3000).")
-        # Non-verbal tag checks.
-        tags_in_chunk = _TAG_RE.findall(text)
-        if len(tags_in_chunk) > 1:
-            warnings.append(f"Chunk {cid}: {len(tags_in_chunk)} non-verbal tags "
-                            f"in one chunk (max 1): {tags_in_chunk}")
-        for t in tags_in_chunk:
-            if t not in ALLOWED_TAGS:
-                warnings.append(f"Chunk {cid}: unknown non-verbal tag {t!r} "
-                                f"(allowed: {sorted(ALLOWED_TAGS)})")
-        total_tags += len(tags_in_chunk)
     if chunks and chunks[-1].get("gap_after_ms") not in (0, 0.0):
         warnings.append("Last chunk's gap_after_ms should be 0.")
-    # Tags should be rare. Flag if the LLM got tag-happy.
-    if total_tags > max(4, len(chunks) // 8):
-        warnings.append(f"{total_tags} non-verbal tags across {len(chunks)} "
-                        f"chunks — likely too many; tags should be a rare "
-                        f"seasoning. Review and trim.")
-    # Flag any digits that survived normalization.
-    for c in chunks:
-        if any(ch.isdigit() for ch in c.get("text", "")):
-            warnings.append(f"Chunk {c.get('id')}: still contains digits — "
-                            f"check number expansion.")
     # Coverage: every pySBD sentence used exactly once.
     if expected_sentence_ids is not None:
         used = []
@@ -527,6 +484,29 @@ def validate_plan(plan: dict, expected_sentence_ids: set[str] | None = None) -> 
             warnings.append(f"Unknown sentence IDs in chunks: {sorted(extra)}")
         if dupes:
             warnings.append(f"Sentences used more than once: {sorted(dupes)}")
+    # Round-trip check: concatenating chunks' source_text (in narrative
+    # order) must reproduce the original column's sentences exactly. This is
+    # a self-check on the SCRIPT's own construction (build_source_text), not
+    # on the LLM -- the LLM never touches wording, so a mismatch here means a
+    # bug in chunk construction, not a paraphrase to catch.
+    if rows is not None:
+        lookup = sentence_lookup(rows)
+        ordered = sorted(
+            chunks,
+            key=lambda c: min(
+                (lookup[s]["_order"] for s in c.get("sentences", []) if s in lookup),
+                default=-1,
+            ),
+        )
+        rebuilt = " ".join(c.get("source_text", "") for c in ordered if c.get("source_text"))
+        expected_full = " ".join(r["text"] for r in rows)
+        if rebuilt != expected_full:
+            warnings.append(
+                "source_text round-trip check FAILED: concatenated chunks' "
+                "source_text does not exactly match the original column "
+                "sentences. This indicates a bug in chunk construction (not "
+                "the LLM) -- do not trust this plan until investigated."
+            )
     return warnings
 
 
@@ -554,12 +534,21 @@ def main():
                          "is an error.")
     ap.add_argument("--no-lexicon", action="store_true", default=False,
                     help="Skip lexicon application even if lexicon.json exists.")
+    ap.add_argument("--style-profile", default=default_style_profile(),
+                    help="The '(stijl: ...)' descriptor interpolated into the system "
+                         "prompt. Defaults to NARRATE_STYLE_PROFILE (env or .env) if "
+                         "set, else a generic, safe-to-commit profile. A project "
+                         "cloning a specific real voice should override this via "
+                         "voice.json or NARRATE_STYLE_PROFILE -- never commit a real "
+                         "person's name here (see README).")
 
-    CONFIGURABLE = {"model", "config_id", "gap_scale", "crossfade_ms", "lexicon"}
+    CONFIGURABLE = {"model", "config_id", "gap_scale", "crossfade_ms", "lexicon",
+                     "style_profile"}
     ap.add_argument("--config", type=Path, default=Path("voice.json"),
                     help="Shared per-voice defaults JSON (see scripts/_pipeline_config.py "
                          "and scripts/voice.example.json). Keys: model, config_id, "
-                         "gap_scale, crossfade_ms, lexicon. CLI flags always override it.")
+                         "gap_scale, crossfade_ms, lexicon, style_profile. CLI flags "
+                         "always override it.")
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--config", type=Path, default=Path("voice.json"))
     config = load_voice_config(pre.parse_known_args()[0].config)
@@ -576,27 +565,11 @@ def main():
     if not column:
         sys.exit("Input file is empty.")
 
-    # Apply the pronunciation lexicon BEFORE splitting/LLM, so the respelled
-    # forms flow through untouched. Default file may not exist yet — that's fine.
-    if not args.no_lexicon:
-        lex_path = args.lexicon
-        lexicon = {}
-        if lex_path.exists():
-            lexicon = load_lexicon(lex_path)
-        elif args.lexicon != (Path(__file__).resolve().parent / "lexicon.json"):
-            # Explicitly-passed path that doesn't exist → error (load_lexicon exits).
-            lexicon = load_lexicon(lex_path)
-        if lexicon:
-            column, applied = apply_lexicon(column, lexicon)
-            if applied:
-                print(f"Lexicon applied ({lex_path.name}):")
-                for original, respelling, n in applied:
-                    print(f"  {original!r} → {respelling!r}  ×{n}")
-            else:
-                print(f"Lexicon loaded ({len(lexicon)} entries) — "
-                      f"no matches in this column.")
-
-    # Deterministic sentence split first (pySBD, Dutch) — the LLM groups these.
+    # Sentence split FIRST, on the RAW column -- before any lexicon or
+    # normalization touches it. source_text (built below, per chunk) comes
+    # straight from these rows, so the pronunciation layer can never
+    # contaminate the audit reference. The LLM also sees these raw sentences;
+    # respelling/number-expansion has no bearing on its structural decisions.
     rows = split_sentences(column)
     if not rows:
         sys.exit("No sentences found after splitting.")
@@ -607,7 +580,7 @@ def main():
 
     print(f"Grouping into delivery units via {args.model}...")
     client = build_client(args.api_key, args.config_id)
-    raw = call_llm(client, args.model, sentences_block)
+    raw = call_llm(client, args.model, sentences_block, args.style_profile)
 
     try:
         plan = parse_plan(raw)
@@ -617,12 +590,46 @@ def main():
         dump.write_text(raw, encoding="utf-8")
         sys.exit(f"Could not parse JSON: {e}\nRaw model output saved to {dump}")
 
+    # Load the pronunciation lexicon once (applied per chunk below, AFTER
+    # source_text is built -- never before, so it can't touch the audit copy).
+    lexicon = {}
+    if not args.no_lexicon:
+        lex_path = args.lexicon
+        default_lexicon_path = Path(__file__).resolve().parent / "lexicon.json"
+        if lex_path.exists() or lex_path != default_lexicon_path:
+            # Missing default lexicon is silently skipped; an explicitly
+            # passed missing path is an error (load_lexicon exits).
+            lexicon = load_lexicon(lex_path)
+
+    # Build source_text (raw, verbatim) and spoken_text (lexicon + deterministic
+    # number/abbreviation normalization) for each chunk. The LLM never sees or
+    # writes this text -- see the module docstring for why.
+    lookup = sentence_lookup(rows)
+    lexicon_hits = {}  # original -> total count across all chunks, for the summary
+    for c in plan.get("chunks", []):
+        c.pop("text", None)  # untrusted if the LLM included it despite instructions
+        source_text = build_source_text(c.get("sentences", []), lookup)
+        c["source_text"] = source_text
+        lexed_text, applied = apply_lexicon(source_text, lexicon)
+        for original, respelling, n in applied:
+            lexicon_hits[original] = (respelling, lexicon_hits.get(original, (respelling, 0))[1] + n)
+        c["spoken_text"] = normalize_dutch(lexed_text)
+
+    if lexicon:
+        if lexicon_hits:
+            print(f"Lexicon applied ({args.lexicon.name}):")
+            for original, (respelling, n) in lexicon_hits.items():
+                print(f"  {original!r} → {respelling!r}  ×{n}")
+        else:
+            print(f"Lexicon loaded ({len(lexicon)} entries) — "
+                  f"no matches in this column.")
+
     # Stitch config: gaps are per-chunk (gap_after_ms). These are global knobs.
     plan.setdefault("config", {})
     plan["config"]["gap_scale"] = args.gap_scale
     plan["config"]["crossfade_ms"] = args.crossfade_ms
 
-    warnings = validate_plan(plan, expected_sentence_ids=expected_ids)
+    warnings = validate_plan(plan, expected_sentence_ids=expected_ids, rows=rows)
 
     args.output.write_text(
         json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8"

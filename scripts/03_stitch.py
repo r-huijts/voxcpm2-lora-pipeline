@@ -40,6 +40,7 @@ Requires: numpy, soundfile. Optional: ffmpeg (for --loudnorm).
 """
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -47,6 +48,16 @@ import numpy as np
 import soundfile as sf
 
 from _pipeline_config import load_voice_config, apply_config_defaults
+from _plan_schema import resolve_source_text
+from _srt import build_srt
+from _run_report import build_report_rows, compute_totals, format_report_txt
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "")
 
 
 def trim_silence(audio: np.ndarray, sr: int, thresh_db: float = -40.0,
@@ -150,15 +161,21 @@ def main():
                          "chunk, uses chunk_NNNN_vK.wav when a pick exists, else "
                          "falls back to the plain chunk_NNNN.wav. Defaults to "
                          "selection.json in --run-dir if present.")
+    ap.add_argument("--label-ai-generated", action=argparse.BooleanOptionalAction,
+                    default=_env_bool("NARRATE_LABEL_AI_GENERATED", True),
+                    help="Note in the console output (and timeline.json, once written "
+                         "by a run that includes it) that this audio is AI-generated -- "
+                         "provenance documentation, not an audio watermark. Default true; "
+                         "override via NARRATE_LABEL_AI_GENERATED or --no-label-ai-generated.")
 
-    CONFIGURABLE = {"gap_scale", "crossfade_ms", "lufs", "loudnorm"}
+    CONFIGURABLE = {"gap_scale", "crossfade_ms", "lufs", "loudnorm", "label_ai_generated"}
     ap.add_argument("--config", type=Path, default=Path("voice.json"),
                     help="Shared per-voice defaults JSON (see scripts/_pipeline_config.py "
                          "and scripts/voice.example.json). Keys: gap_scale, crossfade_ms, "
-                         "lufs, loudnorm. CLI flags always override it (pass "
-                         "--no-loudnorm to force it off for one run even if voice.json "
-                         "sets it); a gap_scale/crossfade_ms set here also takes "
-                         "priority over the values baked into this run's manifest.json.")
+                         "lufs, loudnorm, label_ai_generated. CLI flags always override it "
+                         "(pass --no-loudnorm to force it off for one run even if "
+                         "voice.json sets it); a gap_scale/crossfade_ms set here also "
+                         "takes priority over the values baked into this run's manifest.json.")
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--config", type=Path, default=Path("voice.json"))
     config = load_voice_config(pre.parse_known_args()[0].config)
@@ -211,9 +228,21 @@ def main():
 
     print(f"Stitching {len(items)} chunks "
           f"(gap_scale={gap_scale}, crossfade={crossfade_ms}ms)")
+    if args.label_ai_generated:
+        print("NOTE: this output is AI-generated (voice clone) -- "
+              "provenance documentation, not an audio watermark.")
 
     timeline = None
     sr = None
+    # Sample-accurate placement of each chunk in the final timeline, for
+    # timeline.json / the .srt below. Tracked in SAMPLES (exact integers),
+    # not seconds, to avoid accumulated float drift over a long piece.
+    # Derived from the ACTUAL post-crossfade array lengths rather than by
+    # re-deriving equal_power_crossfade's own overlap logic, so this can
+    # never silently drift from what was really stitched: a crossfade
+    # shortens the total by the overlap length, so naively summing nominal
+    # chunk lengths would drift progressively over a long piece.
+    timeline_entries = []
 
     for item in items:
         wav_path = resolve_chunk_file(args.run_dir, item, selection)
@@ -235,12 +264,29 @@ def main():
         else:
             timeline = equal_power_crossfade(timeline, audio, sr, crossfade_ms)
 
+        end_samples = len(timeline)
+        start_samples = end_samples - len(audio)
+
         # Per-chunk numeric gap, scaled globally.
         gap_ms = float(item.get("gap_after_ms", 300)) * gap_scale
+        gap_samples = 0
         if gap_ms > 0:
-            timeline = np.concatenate([timeline, silence(sr, int(round(gap_ms)))])
+            gap_audio = silence(sr, int(round(gap_ms)))
+            gap_samples = len(gap_audio)
+            timeline = np.concatenate([timeline, gap_audio])
 
-    # Optional loudness normalization (in-memory, pyloudnorm).
+        timeline_entries.append({
+            "id": item.get("id"),
+            "file": wav_path.name,
+            "start_samples": start_samples,
+            "end_samples": end_samples,
+            "gap_samples": gap_samples,
+            "source_text": resolve_source_text(item),
+        })
+
+    # Optional loudness normalization (in-memory, pyloudnorm). Amplitude
+    # only -- does not change sample count, so the timeline above still
+    # matches after this.
     if args.loudnorm:
         print(f"Loudness normalizing to {args.lufs} LUFS (EBU R128)...")
         timeline = loudnorm(timeline, sr, args.lufs)
@@ -249,10 +295,74 @@ def main():
     sf.write(args.output, timeline, sr)
 
     dur = len(timeline) / sr
-    print(f"\nDone: {args.output}  ({dur:.1f}s)")
+    print(f"\nDone: {args.output}  ({dur:.1f}s)"
+          + (" [AI-generated]" if args.label_ai_generated else ""))
     print("To slow overall tempo if needed:")
     print(f"  ffmpeg -i {args.output} -filter:a \"atempo=0.85\" "
           f"{args.output.with_name(args.output.stem + '_slow.wav')}")
+
+    # Self-check: the last chunk's end (+ its trailing gap, if any) must
+    # equal the actual stitched audio's total sample count exactly.
+    if timeline_entries:
+        last = timeline_entries[-1]
+        assert last["end_samples"] + last["gap_samples"] == len(timeline), (
+            f"internal error: computed timeline length "
+            f"{last['end_samples'] + last['gap_samples']} != actual stitched "
+            f"audio length {len(timeline)}"
+        )
+
+    for e in timeline_entries:
+        e["start"] = round(e["start_samples"] / sr, 3)
+        e["end"] = round(e["end_samples"] / sr, 3)
+        e["duration"] = round((e["end_samples"] - e["start_samples"]) / sr, 3)
+        e["gap_after"] = round(e["gap_samples"] / sr, 3)
+
+    timeline_path = args.output.parent / "timeline.json"
+    timeline_data = {
+        "output": args.output.name,
+        "sample_rate": sr,
+        "total_seconds": round(dur, 3),
+        "ai_generated": bool(args.label_ai_generated),
+        "chunks": [
+            {"id": e["id"], "file": e["file"], "start": e["start"], "end": e["end"],
+             "duration": e["duration"], "gap_after": e["gap_after"]}
+            for e in timeline_entries
+        ],
+    }
+    timeline_path.write_text(json.dumps(timeline_data, ensure_ascii=False, indent=2),
+                              encoding="utf-8")
+    print(f"Timeline: {timeline_path}")
+
+    srt_path = args.output.with_suffix(".srt")
+    srt_entries = [
+        {"text": e["source_text"] or str(e["id"]), "start": e["start"], "end": e["end"]}
+        for e in timeline_entries
+    ]
+    srt_path.write_text(build_srt(srt_entries), encoding="utf-8")
+    print(f"Subtitles: {srt_path}")
+
+    # ── run_report (Sub-task 5b): aggregate wer_log.json + this timeline +
+    # the candidate selection into one glanceable QA sheet. Regenerates
+    # correctly on every stitch, including after picking a new selection.
+    wer_log_path = args.run_dir / "wer_log.json"
+    wer_log_data = {}
+    if wer_log_path.exists():
+        try:
+            wer_log_data = json.loads(wer_log_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"WARNING: could not read wer_log.json for run_report: {e}")
+    wer_by_id = {c["id"]: c for c in wer_log_data.get("chunks", [])}
+
+    report_rows = build_report_rows(timeline_entries, wer_by_id, selection,
+                                     wer_log_data.get("threshold"))
+    totals = compute_totals(report_rows, dur)
+    report_txt = format_report_txt(str(args.run_dir), str(args.output), report_rows, totals)
+    (args.run_dir / "run_report.txt").write_text(report_txt, encoding="utf-8")
+    (args.run_dir / "run_report.json").write_text(
+        json.dumps({"totals": totals, "chunks": report_rows}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(f"Run report: {args.run_dir / 'run_report.txt'}")
 
 
 if __name__ == "__main__":

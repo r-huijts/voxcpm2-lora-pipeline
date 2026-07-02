@@ -79,6 +79,15 @@ import warnings
 from pathlib import Path
 
 from _pipeline_config import load_voice_config, apply_config_defaults
+from _plan_schema import resolve_source_text, resolve_spoken_text
+from _carryover import should_carry_over
+from _duration_gate import (
+    BUILTIN_DEFAULT_SEC_PER_WORD,
+    check_dragging,
+    check_duration,
+    resolve_duration_target,
+    select_best_attempt,
+)
 
 # ── silence harmless third-party noise ─────────────────────────────────────
 # torch weight_norm deprecation, torchaudio TorchCodec-migration warnings, and
@@ -263,22 +272,39 @@ def generate_with_retry(
     max_retries: int,
     sample_rate: int,
     wer_reference: str | None = None,
-) -> tuple[np.ndarray, float, int]:
+    duration_gate: bool = True,
+    target_sec_per_word: float = BUILTIN_DEFAULT_SEC_PER_WORD,
+    duration_floor: float = 0.5,
+    runaway_ratio: float = 2.0,
+    dragging_ratio: float | None = None,
+) -> tuple:
     """
-    Generate audio for one chunk, retrying if WER exceeds threshold.
+    Generate audio for one chunk, retrying if WER exceeds threshold OR the
+    duration-ratio gate fails (see _duration_gate.py: too short/rushed, or a
+    "runaway" generation that never cleanly stopped -- VoxCPM's documented
+    failure mode that otherwise fills VRAM silently). The duration gate does
+    NOT require ASR and still runs when asr_model is None / --no-asr is set.
 
     `text` is what the model synthesises (may include a (control) parenthetical
     and inline [tags]). `wer_reference`, if given, is the clean spoken text used
-    for WER scoring — without the parenthetical or non-verbal tags, since the
-    model should not voice those. Falls back to `text` when not provided.
+    for BOTH WER scoring and the duration gate's word count — without the
+    parenthetical or non-verbal tags, since the model should not voice those.
+    Falls back to `text` when not provided.
 
-    Returns (best_audio, best_wer, attempts_used, accepted_transcript).
+    Best-attempt selection when no single attempt cleanly passes both gates:
+    prefer attempts passing BOTH (lowest WER among those, ties broken by
+    closeness to the expected duration); else the lowest-WER attempt that at
+    least passes duration; else the lowest-WER attempt overall.
+
+    Returns (best_audio, best_wer, attempts_used, accepted_transcript,
+    best_sec_per_word, best_duration_ok, best_duration_reason).
     best_wer is -1.0 if ASR was skipped; accepted_transcript is "" then too.
-    The transcript is the Whisper output of the KEPT attempt only, so a
-    pronunciation diff built from it reflects shipped audio, not discarded
-    retries.
+    best_duration_reason is "ok" / "too_short" / "runaway", or "skipped" when
+    duration_gate is False.
     """
     wer_target = wer_reference if wer_reference is not None else text
+    words = len(wer_target.split())
+
     def _generate_once(ref_audio_latents) -> np.ndarray:
         if prompt_id is not None:
             gen = server.generate(
@@ -301,45 +327,77 @@ def generate_with_retry(
             )
         return collect_chunks(gen)
 
-    best_audio = None
-    best_wer = float("inf")
-    best_transcript = ""
+    attempts_data = []
     attempts = 0
 
     for attempt in range(1, max_retries + 2):  # +2: initial attempt + max_retries
         attempts = attempt
         wav = _generate_once(ref_latents)
         wav = trim_silence(wav, sample_rate)
+        audio_seconds = len(wav) / sample_rate
 
-        if asr_model is None:
-            # No ASR — accept immediately, no transcript available.
-            return wav, -1.0, attempts, ""
-
-        transcript = _transcribe(asr_model, wav, sample_rate)
-        current_wer = _compute_wer(wer_target, transcript)
-
-        if best_audio is None or current_wer < best_wer:
-            best_audio = wav
-            best_wer = current_wer
-            best_transcript = transcript
-
-        wer_pct = f"{current_wer * 100:.1f}%"
-        if current_wer <= wer_threshold:
-            if attempt > 1:
-                print(f"         [asr] attempt {attempt}: WER={wer_pct} ✓ accepted")
-            else:
-                print(f"         [asr] WER={wer_pct} ✓")
-            return best_audio, best_wer, attempts, best_transcript
-
-        # Threshold exceeded.
-        if attempt <= max_retries:
-            print(f"         [asr] attempt {attempt}: WER={wer_pct} > "
-                  f"{wer_threshold * 100:.0f}% — retrying...")
+        if asr_model is not None:
+            transcript = _transcribe(asr_model, wav, sample_rate)
+            current_wer = _compute_wer(wer_target, transcript)
+            wer_ok = current_wer <= wer_threshold
         else:
-            print(f"         [asr] attempt {attempt}: WER={wer_pct} — "
-                  f"retries exhausted, keeping best ({best_wer * 100:.1f}%)")
+            transcript = ""
+            current_wer = -1.0
+            wer_ok = True
 
-    return best_audio, best_wer, attempts, best_transcript
+        if duration_gate:
+            dur_ok, dur_reason, sec_per_word, expected_seconds = check_duration(
+                audio_seconds, words, target_sec_per_word, duration_floor, runaway_ratio,
+            )
+        else:
+            dur_ok, dur_reason = True, "skipped"
+            sec_per_word = audio_seconds / words if words else 0.0
+            expected_seconds = words * target_sec_per_word if words else 0.0
+
+        if dur_ok and check_dragging(audio_seconds, expected_seconds, dragging_ratio):
+            print(f"         [duration] NOTE: dragging ({sec_per_word:.2f}s/word, "
+                  f"{audio_seconds:.1f}s vs ~{expected_seconds:.1f}s expected) — informational only.")
+
+        attempts_data.append(dict(
+            audio=wav, wer=current_wer, transcript=transcript,
+            wer_ok=wer_ok, dur_ok=dur_ok, dur_reason=dur_reason,
+            sec_per_word=sec_per_word, expected_seconds=expected_seconds,
+        ))
+
+        status_bits = []
+        if asr_model is not None:
+            status_bits.append(f"WER={current_wer * 100:.1f}%")
+        if duration_gate and words > 0:
+            status_bits.append(f"{sec_per_word:.2f}s/word (~{expected_seconds:.1f}s expected)")
+        status = " ".join(status_bits)
+
+        if wer_ok and dur_ok:
+            tag = "accepted" if attempt > 1 else "✓"
+            print(f"         [quality] attempt {attempt}: {status} ✓ {tag}")
+            break
+
+        reasons = []
+        if not wer_ok:
+            reasons.append(f"WER>{wer_threshold * 100:.0f}%")
+        if not dur_ok:
+            reasons.append("RUNAWAY (hit max length, no clean stop)"
+                            if dur_reason == "runaway" else "too short/rushed")
+        if attempt <= max_retries:
+            print(f"         [quality] attempt {attempt}: {status} — "
+                  f"{', '.join(reasons)} — retrying...")
+        else:
+            print(f"         [quality] attempt {attempt}: {status} — "
+                  f"{', '.join(reasons)} — retries exhausted, keeping best")
+
+    best = select_best_attempt(attempts_data, target_sec_per_word)
+    if not (best["wer_ok"] and best["dur_ok"]) and any(
+        a["dur_reason"] == "runaway" for a in attempts_data
+    ):
+        print(f"         [duration] RUNAWAY (hit max length, no clean stop) on all "
+              f"attempts — keeping least-bad ({best['sec_per_word']:.2f}s/word).")
+
+    return (best["audio"], best["wer"], attempts, best["transcript"],
+            best["sec_per_word"], best["dur_ok"], best["dur_reason"])
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -596,6 +654,40 @@ def main():
                            help="Max regeneration attempts per chunk before "
                                 "keeping the best result (default 2).")
 
+    # Duration-ratio gate: catches rushed/truncated chunks (WER can't see
+    # delivery) and "runaway" generations that never cleanly stop (a
+    # documented VoxCPM failure mode that otherwise fills VRAM silently).
+    # Independent of ASR -- runs even with --no-asr.
+    dur_group = ap.add_argument_group("Duration-ratio gate")
+    dur_group.add_argument("--no-duration-gate", dest="duration_gate",
+                           action="store_false", default=True,
+                           help="Disable the duration-ratio gate entirely "
+                                "(restores prior behavior exactly).")
+    dur_group.add_argument("--sec-per-word-target", type=float, default=None,
+                           help="Seconds-per-word baseline to judge chunk duration "
+                                "against. Default: use a conservative built-in value "
+                                "until --baseline-min-chunks chunks are accepted, "
+                                "then the running median of accepted chunks.")
+    dur_group.add_argument("--baseline-min-chunks", type=int, default=5,
+                           help="Accepted chunks needed before trusting the running "
+                                "median over the built-in default (default 5). Early "
+                                "chunks may themselves be flawed.")
+    dur_group.add_argument("--duration-floor", type=float, default=0.5,
+                           help="A chunk is rejected as too short/rushed when its "
+                                "audio is under this fraction of "
+                                "(words * target_sec_per_word) (default 0.5).")
+    dur_group.add_argument("--runaway-ratio", type=float, default=2.0,
+                           help="A chunk is flagged RUNAWAY when its audio exceeds "
+                                "this multiple of the expected duration (default "
+                                "2.0) -- catches a generation that never cleanly "
+                                "stopped, judged by ratio-to-expected, never by "
+                                "absolute length.")
+    dur_group.add_argument("--duration-ceiling", type=float, default=None,
+                           help="Optional informational-only warning (no retry) when "
+                                "a chunk exceeds this multiple of the expected "
+                                "duration but isn't bad enough to count as RUNAWAY. "
+                                "Off by default.")
+
     ap.add_argument("--interactive", action="store_true", default=False,
                     help="After the run, keep the model loaded and drop into a "
                          "prompt for regenerating individual chunks fast (no "
@@ -609,7 +701,9 @@ def main():
                      "temperature", "max_generate_length", "prosody_tail",
                      "gpu_memory_utilization", "max_model_len", "controllable",
                      "reground", "reground_anchor_frames", "whisper_model",
-                     "wer_threshold", "max_retries"}
+                     "wer_threshold", "max_retries", "sec_per_word_target",
+                     "baseline_min_chunks", "duration_floor", "runaway_ratio",
+                     "duration_ceiling"}
     ap.add_argument("--config", type=Path, default=Path("voice.json"),
                     help="Shared per-voice defaults JSON (see scripts/_pipeline_config.py "
                          "and scripts/voice.example.json). Lets --lora/--reference/tuning "
@@ -834,12 +928,32 @@ def main():
     n_done = 0
     total_audio_s = 0.0
     total_retries = 0
-    wer_log = []  # (chunk_id, wer, attempts)
+    wer_log = []  # (chunk_id, wer, attempts, sec_per_word, duration_ok, duration_reason)
     pron_diffs = []  # [{id, ref, heard, is_proper}, ...] across accepted chunks
 
-    for c in chunks:
+    # Duration-gate baseline: seed from a prior run's wer_log.json if present
+    # (e.g. an --only-chunks rerun), so a small partial run still benefits
+    # from the full run's established pace instead of restarting at the
+    # conservative built-in default.
+    wer_log_path = args.out_dir / "wer_log.json"
+    accepted_sec_per_word: list[float] = []
+    if wer_log_path.exists():
+        try:
+            prior_log = json.loads(wer_log_path.read_text(encoding="utf-8"))
+            accepted_sec_per_word = [
+                e["sec_per_word"] for e in prior_log.get("chunks", [])
+                if isinstance(e.get("sec_per_word"), (int, float))
+            ]
+            if accepted_sec_per_word:
+                print(f"Duration baseline seeded from prior run: "
+                      f"{len(accepted_sec_per_word)} chunk(s).")
+        except Exception:
+            pass
+
+    for idx, c in enumerate(chunks):
+        prev_c = chunks[idx - 1] if idx > 0 else None
         cid = int(c["id"])
-        text = c["text"]
+        text = resolve_spoken_text(c)
         control = c.get("control", "")
 
         if args.no_control:
@@ -865,6 +979,8 @@ def main():
             "file": wav_name,
             "gap_after_ms": gap_after_ms,
             "control": control,
+            "source_text": resolve_source_text(c),
+            "spoken_text": text,  # already resolve_spoken_text(c), computed above
         })
 
         if cid < args.start_at:
@@ -895,52 +1011,75 @@ def main():
                       f"{wav_name}; carry-over unchanged")
             continue
 
-        ref_carry = "yes" if prev_ref_latents else "no"
+        # Carry-over should only flow WITHIN a rhetorical thought: suppressed
+        # when the previous chunk's position is "final" or this chunk's is
+        # "opening" (see should_carry_over), unless the plan explicitly
+        # overrides it via the previous chunk's carryover_after field.
+        carry_ok, carry_reason = should_carry_over(prev_c, c)
+        tail_latents = prev_ref_latents if carry_ok else None
+
+        ref_carry = "yes" if tail_latents else f"no ({carry_reason})"
         ctrl_str = f" ctrl='{control}'" if (args.controllable and control.strip()) else ""
 
         # ── decide what goes in the ref_audio_latents slot ─────────────────
         # Hi-Fi: timbre comes from prompt_id, so the slot is pure prosody
-        #   carry-over (previous tail), unchanged from before.
+        #   carry-over (previous tail, subject to the suppression above).
         # Controllable: the slot is the ONLY voice anchor, so we reground the
-        #   original reference into it according to --reground.
+        #   original reference into it according to --reground; suppressing
+        #   the tail never drops the anchor itself.
         reground_tag = ""
         if not args.controllable or ref_anchor_latents is None or reground_mode == "off":
-            chunk_ref_latents = prev_ref_latents
+            chunk_ref_latents = tail_latents
         elif reground_mode == "every":
-            # Original reference + previous tail, every chunk. True anchor +
-            # prosody continuity in one slot.
+            # Original reference + previous tail (if carried), every chunk.
+            # True anchor + prosody continuity in one slot.
             chunk_ref_latents = concat_latents(
-                ref_anchor_latents, prev_ref_latents, feat_dim=feat_dim
+                ref_anchor_latents, tail_latents, feat_dim=feat_dim
             )
-            reground_tag = " reground=ref+tail"
+            reground_tag = " reground=ref+tail" if tail_latents else " reground=ref-only"
         else:  # mode == "n": hard reset every N chunks
-            if (n_done % reground_n) == 0 or prev_ref_latents is None:
+            if (n_done % reground_n) == 0 or tail_latents is None:
                 chunk_ref_latents = ref_anchor_latents
                 reground_tag = " reground=hard"
             else:
-                chunk_ref_latents = prev_ref_latents
+                chunk_ref_latents = tail_latents
 
         print(f"[{cid:03d}/{n_total:03d}] ref_carry={ref_carry}{ctrl_str}{reground_tag} | "
               f"{text[:55]}{'...' if len(text) > 55 else ''}")
 
         t_chunk = time.time()
 
-        wav, chunk_wer, attempts, accepted_transcript = generate_with_retry(
-            server=server,
-            text=target_text,
-            prompt_id=prompt_id,
-            ref_latents=chunk_ref_latents,
-            zero_shot_latents=zero_shot_latents,
-            cfg=args.cfg,
-            temperature=args.temperature,
-            max_generate_length=args.max_generate_length,
-            lora_name=LORA_NAME,
-            asr_model=asr_model,
-            wer_threshold=args.wer_threshold,
-            max_retries=args.max_retries,
-            sample_rate=sample_rate,
-            wer_reference=clean_for_wer(target_text),
+        target_sec_per_word, target_source = resolve_duration_target(
+            accepted_sec_per_word, args.sec_per_word_target, args.baseline_min_chunks,
         )
+        if args.duration_gate:
+            print(f"         [duration] target: {target_source}")
+
+        wav, chunk_wer, attempts, accepted_transcript, sec_per_word, duration_ok, duration_reason = (
+            generate_with_retry(
+                server=server,
+                text=target_text,
+                prompt_id=prompt_id,
+                ref_latents=chunk_ref_latents,
+                zero_shot_latents=zero_shot_latents,
+                cfg=args.cfg,
+                temperature=args.temperature,
+                max_generate_length=args.max_generate_length,
+                lora_name=LORA_NAME,
+                asr_model=asr_model,
+                wer_threshold=args.wer_threshold,
+                max_retries=args.max_retries,
+                sample_rate=sample_rate,
+                wer_reference=clean_for_wer(target_text),
+                duration_gate=args.duration_gate,
+                target_sec_per_word=target_sec_per_word,
+                duration_floor=args.duration_floor,
+                runaway_ratio=args.runaway_ratio,
+                dragging_ratio=args.duration_ceiling,
+            )
+        )
+        if args.duration_gate and sec_per_word > 0:
+            accepted_sec_per_word.append(sec_per_word)
 
         sf.write(wav_path, wav, sample_rate, subtype="PCM_16")
 
@@ -951,7 +1090,7 @@ def main():
         n_done += 1
         retries_this_chunk = attempts - 1
         total_retries += retries_this_chunk
-        wer_log.append((cid, chunk_wer, attempts))
+        wer_log.append((cid, chunk_wer, attempts, sec_per_word, duration_ok, duration_reason))
 
         # Pronunciation diff from the ACCEPTED attempt's transcript only.
         if accepted_transcript:
@@ -993,48 +1132,68 @@ def main():
           f"{total_audio_s:.1f}s audio | "
           f"wall {total_wall:.1f}s | avg RTF {avg_rtf:.2f}")
 
-    if asr_model is not None and wer_log:
-        valid_wers = [(cid, w, a) for cid, w, a in wer_log if w >= 0]
+    if wer_log:
+        # Duration data is independent of ASR, so this now writes even with
+        # --no-asr; WER-specific fields are simply None in that case.
+        valid_wers = [e for e in wer_log if e[1] >= 0]
         if valid_wers:
-            avg_wer = sum(w for _, w, _ in valid_wers) / len(valid_wers)
-            worst = max(valid_wers, key=lambda x: x[1])
+            avg_wer = sum(e[1] for e in valid_wers) / len(valid_wers)
+            worst = max(valid_wers, key=lambda e: e[1])
             print(f"ASR summary: avg WER={avg_wer * 100:.1f}% | "
                   f"total retries={total_retries} | "
                   f"worst chunk={worst[0]} ({worst[1] * 100:.1f}% WER, "
                   f"{worst[2]} attempts)")
 
-            wer_log_path = args.out_dir / "wer_log.json"
-            new_entries = {cid: {"id": cid, "wer": round(w, 4), "attempts": a}
-                           for cid, w, a in valid_wers}
+        duration_failures = [e for e in wer_log if not e[4]]
+        if args.duration_gate and duration_failures:
+            runaways = [e for e in duration_failures if e[5] == "runaway"]
+            print(f"Duration gate: {len(duration_failures)}/{len(wer_log)} chunk(s) "
+                  f"never cleanly passed"
+                  + (f" ({len(runaways)} RUNAWAY)" if runaways else "") + ".")
 
-            # In --only-chunks mode, merge the regenerated chunks' results into
-            # the existing wer_log rather than replacing the whole file with a
-            # partial one.
-            merged = dict(new_entries)
-            if only_chunks is not None and wer_log_path.exists():
-                try:
-                    prior = json.loads(wer_log_path.read_text(encoding="utf-8"))
-                    for entry in prior.get("chunks", []):
-                        if entry["id"] not in merged:
-                            merged[entry["id"]] = entry
-                except Exception as e:
-                    print(f"WARNING: could not merge prior wer_log: {e}")
-
-            chunks_sorted = [merged[k] for k in sorted(merged)]
-            all_wers = [e["wer"] for e in chunks_sorted]
-            wer_log_data = {
-                "avg_wer": round(sum(all_wers) / len(all_wers), 4) if all_wers else 0.0,
-                "total_retries": total_retries,
-                "threshold": args.wer_threshold,
-                "whisper_model": args.whisper_model,
-                "regenerated": sorted(only_chunks) if only_chunks else "all",
-                "chunks": chunks_sorted,
+        new_entries = {
+            cid: {
+                "id": cid,
+                "wer": round(w, 4) if w >= 0 else None,
+                "attempts": a,
+                "sec_per_word": round(spw, 4) if spw else None,
+                "duration_ok": dok,
+                "duration_reason": dreason,
             }
-            wer_log_path.write_text(
-                json.dumps(wer_log_data, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            print(f"WER log:  {wer_log_path}")
+            for cid, w, a, spw, dok, dreason in wer_log
+        }
+
+        # In --only-chunks mode, merge the regenerated chunks' results into
+        # the existing wer_log rather than replacing the whole file with a
+        # partial one.
+        merged = dict(new_entries)
+        if only_chunks is not None and wer_log_path.exists():
+            try:
+                prior = json.loads(wer_log_path.read_text(encoding="utf-8"))
+                for entry in prior.get("chunks", []):
+                    if entry["id"] not in merged:
+                        merged[entry["id"]] = entry
+            except Exception as e:
+                print(f"WARNING: could not merge prior wer_log: {e}")
+
+        chunks_sorted = [merged[k] for k in sorted(merged)]
+        all_wers = [e["wer"] for e in chunks_sorted if e.get("wer") is not None]
+        wer_log_data = {
+            "avg_wer": round(sum(all_wers) / len(all_wers), 4) if all_wers else None,
+            "total_retries": total_retries,
+            "threshold": args.wer_threshold if asr_model is not None else None,
+            "whisper_model": args.whisper_model if asr_model is not None else None,
+            "duration_gate": args.duration_gate,
+            "duration_floor": args.duration_floor if args.duration_gate else None,
+            "runaway_ratio": args.runaway_ratio if args.duration_gate else None,
+            "regenerated": sorted(only_chunks) if only_chunks else "all",
+            "chunks": chunks_sorted,
+        }
+        wer_log_path.write_text(
+            json.dumps(wer_log_data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print(f"WER log:  {wer_log_path}")
 
     # ── pronunciation diff ─────────────────────────────────────────────────
     # Words the model was asked to say that Whisper heard differently, from
@@ -1144,20 +1303,23 @@ def main():
             if c is None:
                 print(f"  no chunk with id {cid} in the plan.")
                 return
-            text = c["text"]
+            text = resolve_spoken_text(c)
             control = c.get("control", "")
             if args.controllable and control.strip():
                 target_text = apply_control(text, control)
             else:
                 target_text = text
 
-            # carry-over from the previous chunk id in the plan order
+            # carry-over from the previous chunk id in the plan order, subject
+            # to the same rhetorical-boundary suppression as the batch loop.
             ids_sorted = sorted(plan_lookup)
             pos = ids_sorted.index(cid)
             prev_id = ids_sorted[pos - 1] if pos > 0 else 0
-            prev_latents = _carry_from_prev(prev_id)
+            prev_c = plan_lookup.get(prev_id)
+            carry_ok, carry_reason = should_carry_over(prev_c, c)
+            prev_latents = _carry_from_prev(prev_id) if carry_ok else None
 
-            # ref slot: mirror the batch logic
+            # ref slot: mirror the batch logic (including carry-over suppression)
             if not args.controllable or ref_anchor_latents is None or reground_mode == "off":
                 chunk_ref = prev_latents
             elif reground_mode == "every":
@@ -1166,9 +1328,16 @@ def main():
                 chunk_ref = ref_anchor_latents if prev_latents is None else prev_latents
 
             tag = f" v{version}" if version else ""
-            print(f"  regen chunk {cid}{tag} @ cfg={cfg_v} temp={temp_v}: "
+            carry_str = "yes" if prev_latents else f"no ({carry_reason})"
+            print(f"  regen chunk {cid}{tag} @ cfg={cfg_v} temp={temp_v} "
+                  f"carry={carry_str}: "
                   f"{text[:50]}{'...' if len(text) > 50 else ''}")
-            wav, wer, att, _tr = generate_with_retry(
+            regen_target_spw, regen_target_source = resolve_duration_target(
+                accepted_sec_per_word, args.sec_per_word_target, args.baseline_min_chunks,
+            )
+            if args.duration_gate:
+                print(f"    [duration] target: {regen_target_source}")
+            wav, wer, att, _tr, spw, dok, dreason = generate_with_retry(
                 server=server, text=target_text, prompt_id=prompt_id,
                 ref_latents=chunk_ref, zero_shot_latents=zero_shot_latents,
                 cfg=cfg_v, temperature=temp_v,
@@ -1176,7 +1345,16 @@ def main():
                 lora_name=LORA_NAME, asr_model=asr_model,
                 wer_threshold=args.wer_threshold, max_retries=args.max_retries,
                 sample_rate=sample_rate, wer_reference=clean_for_wer(target_text),
+                duration_gate=args.duration_gate,
+                target_sec_per_word=regen_target_spw,
+                duration_floor=args.duration_floor,
+                runaway_ratio=args.runaway_ratio,
+                dragging_ratio=args.duration_ceiling,
             )
+            if args.duration_gate and spw > 0 and version is None:
+                # Only feed the running baseline from the "canonical" regen
+                # (not throwaway candidate takes), same spirit as the batch loop.
+                accepted_sec_per_word.append(spw)
             if version is None:
                 outp = args.out_dir / f"chunk_{cid:04d}.wav"
             else:
@@ -1228,7 +1406,7 @@ def main():
                 continue
             if raw == "list":
                 for k in sorted(plan_lookup):
-                    t = plan_lookup[k]["text"]
+                    t = resolve_spoken_text(plan_lookup[k])
                     print(f"  {k:3d}  {t[:60]}{'...' if len(t) > 60 else ''}")
                 continue
             # candidate command: cand <id> <k> [--cfg X] [--temp Y]
