@@ -17,13 +17,15 @@ until someone happened to grep for it.
 """
 import argparse
 import importlib.util
+import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from _pipeline_config import apply_config_defaults
+from _pipeline_config import apply_config_defaults, default_voice_config_path
 
 
 def _build_parser():
@@ -103,6 +105,52 @@ def test_unrelated_keys_ignored():
     assert str(args.out_dir) == "out", args.out_dir  # per-run value, never from config
 
 
+def test_default_voice_config_path_prefers_cwd():
+    # Reproduces a real bug: voice.json was only ever looked up relative to
+    # cwd, so running a script from anywhere other than wherever voice.json
+    # lived meant --lora/--reference silently stopped being picked up.
+    with tempfile.TemporaryDirectory() as project_dir, tempfile.TemporaryDirectory() as scripts_dir:
+        (Path(project_dir) / "voice.json").write_text("{}", encoding="utf-8")
+        (Path(scripts_dir) / "voice.json").write_text("{}", encoding="utf-8")
+        fake_script = Path(scripts_dir) / "02_generate_nanovllm.py"
+        real_cwd = os.getcwd()
+        try:
+            os.chdir(project_dir)
+            found = default_voice_config_path(str(fake_script))
+            assert found == Path("voice.json")  # cwd-relative, not the scripts_dir one
+            assert found.resolve() == (Path(project_dir) / "voice.json").resolve()
+        finally:
+            os.chdir(real_cwd)
+
+
+def test_default_voice_config_path_falls_back_to_script_dir():
+    # The case from the bug report: run from a project dir with no
+    # voice.json of its own, but one sits next to the script (e.g. in
+    # scripts/) -- must still be found without passing --config.
+    with tempfile.TemporaryDirectory() as project_dir, tempfile.TemporaryDirectory() as scripts_dir:
+        (Path(scripts_dir) / "voice.json").write_text("{}", encoding="utf-8")
+        fake_script = Path(scripts_dir) / "02_generate_nanovllm.py"
+        real_cwd = os.getcwd()
+        try:
+            os.chdir(project_dir)
+            found = default_voice_config_path(str(fake_script))
+            assert found.resolve() == (Path(scripts_dir) / "voice.json").resolve()
+        finally:
+            os.chdir(real_cwd)
+
+
+def test_default_voice_config_path_neither_exists_falls_back_to_cwd_relative():
+    with tempfile.TemporaryDirectory() as project_dir, tempfile.TemporaryDirectory() as scripts_dir:
+        fake_script = Path(scripts_dir) / "02_generate_nanovllm.py"
+        real_cwd = os.getcwd()
+        try:
+            os.chdir(project_dir)
+            found = default_voice_config_path(str(fake_script))
+            assert found == Path("voice.json")
+        finally:
+            os.chdir(real_cwd)
+
+
 def test_generate_and_stitch_routing():
     """generate_and_stitch.py must route flags to the right subprocess call
     (stitch-only flags never leak into the generate call and vice versa),
@@ -171,6 +219,9 @@ def main():
         test_cli_overrides_config,
         test_boolean_optional_action_override,
         test_unrelated_keys_ignored,
+        test_default_voice_config_path_prefers_cwd,
+        test_default_voice_config_path_falls_back_to_script_dir,
+        test_default_voice_config_path_neither_exists_falls_back_to_cwd_relative,
         test_generate_and_stitch_routing,
     ]
     failures = 0

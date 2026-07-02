@@ -47,7 +47,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-from _pipeline_config import load_voice_config, apply_config_defaults
+from _pipeline_config import default_voice_config_path, load_voice_config, apply_config_defaults
 from _plan_schema import resolve_source_text
 from _srt import build_srt
 from _run_report import build_report_rows, compute_totals, format_report_txt
@@ -169,15 +169,18 @@ def main():
                          "override via NARRATE_LABEL_AI_GENERATED or --no-label-ai-generated.")
 
     CONFIGURABLE = {"gap_scale", "crossfade_ms", "lufs", "loudnorm", "label_ai_generated"}
-    ap.add_argument("--config", type=Path, default=Path("voice.json"),
+    default_config_path = default_voice_config_path(__file__)
+    ap.add_argument("--config", type=Path, default=default_config_path,
                     help="Shared per-voice defaults JSON (see scripts/_pipeline_config.py "
-                         "and scripts/voice.example.json). Keys: gap_scale, crossfade_ms, "
-                         "lufs, loudnorm, label_ai_generated. CLI flags always override it "
-                         "(pass --no-loudnorm to force it off for one run even if "
-                         "voice.json sets it); a gap_scale/crossfade_ms set here also "
-                         "takes priority over the values baked into this run's manifest.json.")
+                         "and scripts/voice.example.json). Looked up in the current "
+                         "directory first, then next to this script. Keys: gap_scale, "
+                         "crossfade_ms, lufs, loudnorm, label_ai_generated. CLI flags "
+                         "always override it (pass --no-loudnorm to force it off for "
+                         "one run even if voice.json sets it); a gap_scale/crossfade_ms "
+                         "set here also takes priority over the values baked into this "
+                         "run's manifest.json.")
     pre = argparse.ArgumentParser(add_help=False)
-    pre.add_argument("--config", type=Path, default=Path("voice.json"))
+    pre.add_argument("--config", type=Path, default=default_config_path)
     config = load_voice_config(pre.parse_known_args()[0].config)
     apply_config_defaults(ap, config, CONFIGURABLE)
 

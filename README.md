@@ -70,10 +70,14 @@ pipeline from and fill in your paths:
 cp scripts/voice.example.json voice.json && nano voice.json
 ```
 
-All three scripts auto-load `./voice.json` (override with `--config <path>`)
-and use it to fill in defaults for the flags listed in the file — anything you
-still pass on the command line wins over the config, and anything in the config
-wins over the script's built-in default. Only genuinely per-run values
+All three scripts auto-load `voice.json`, checked in this order: the current
+directory first, then next to the script itself (e.g. `scripts/voice.json`) —
+so it's found whether you keep one shared `voice.json` in `scripts/` and run
+commands from anywhere, or a separate `voice.json` per project directory.
+Override with `--config <path>` to point at a specific file explicitly. Found
+values fill in defaults for the flags listed in the file — anything you still
+pass on the command line wins over the config, and anything in the config wins
+over the script's built-in default. Only genuinely per-run values
 (`--input`/`--output`, `--plan`, `--out-dir`, `--run-dir`) are never read from
 `voice.json`, so it can't accidentally clobber a specific run.
 

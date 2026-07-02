@@ -75,10 +75,11 @@ import json
 import os
 import re
 import sys
+import time
 import warnings
 from pathlib import Path
 
-from _pipeline_config import load_voice_config, apply_config_defaults
+from _pipeline_config import default_voice_config_path, load_voice_config, apply_config_defaults
 from _plan_schema import resolve_source_text, resolve_spoken_text
 from _carryover import should_carry_over
 from _duration_gate import (
@@ -88,6 +89,7 @@ from _duration_gate import (
     resolve_duration_target,
     select_best_attempt,
 )
+from _streaming import collect_chunks
 
 # ── silence harmless third-party noise ─────────────────────────────────────
 # torch weight_norm deprecation, torchaudio TorchCodec-migration warnings, and
@@ -304,6 +306,10 @@ def generate_with_retry(
     """
     wer_target = wer_reference if wer_reference is not None else text
     words = len(wer_target.split())
+    # Known before generation starts (target_sec_per_word is resolved by the
+    # caller), so the live progress ticker can show "X.Xs / ~Y.Ys expected"
+    # instead of just a bare running total.
+    expected_seconds = words * target_sec_per_word if words else None
 
     def _generate_once(ref_audio_latents) -> np.ndarray:
         if prompt_id is not None:
@@ -325,7 +331,12 @@ def generate_with_retry(
                 max_generate_length=max_generate_length,
                 lora_name=lora_name,
             )
-        return collect_chunks(gen)
+        return collect_chunks(
+            gen,
+            sample_rate=sample_rate,
+            progress_label=f"attempt {attempt}",
+            expected_seconds=expected_seconds,
+        )
 
     attempts_data = []
     attempts = 0
@@ -372,8 +383,8 @@ def generate_with_retry(
         status = " ".join(status_bits)
 
         if wer_ok and dur_ok:
-            tag = "accepted" if attempt > 1 else "✓"
-            print(f"         [quality] attempt {attempt}: {status} ✓ {tag}")
+            tag = "✓ accepted" if attempt > 1 else "✓"
+            print(f"         [quality] attempt {attempt}: {status} {tag}")
             break
 
         reasons = []
@@ -459,19 +470,6 @@ def trim_silence(
     start = max(0, min(above[0], max_trim) - keep)
     end = min(len(audio), max(above[-1], len(audio) - max_trim) + keep)
     return audio[start:end]
-
-
-def collect_chunks(generator) -> np.ndarray:
-    parts = []
-    for c in generator:
-        if c is None:
-            continue
-        arr = np.asarray(c, dtype=np.float32).reshape(-1)
-        if arr.size:
-            parts.append(arr)
-    if not parts:
-        raise RuntimeError("Empty audio returned from generator.")
-    return np.concatenate(parts)
 
 
 def apply_control(text: str, control: str) -> str:
@@ -704,14 +702,18 @@ def main():
                      "wer_threshold", "max_retries", "sec_per_word_target",
                      "baseline_min_chunks", "duration_floor", "runaway_ratio",
                      "duration_ceiling"}
-    ap.add_argument("--config", type=Path, default=Path("voice.json"),
+    default_config_path = default_voice_config_path(__file__)
+    ap.add_argument("--config", type=Path, default=default_config_path,
                     help="Shared per-voice defaults JSON (see scripts/_pipeline_config.py "
-                         "and scripts/voice.example.json). Lets --lora/--reference/tuning "
-                         "flags be set once per project instead of retyped every run. "
-                         "CLI flags always override it (pass --no-controllable to force "
-                         "Hi-Fi for one run even if voice.json sets controllable: true).")
+                         "and scripts/voice.example.json). Looked up in the current "
+                         "directory first, then next to this script -- so it's found "
+                         "whether you run from a project dir or from scripts/. Lets "
+                         "--lora/--reference/tuning flags be set once per project "
+                         "instead of retyped every run. CLI flags always override it "
+                         "(pass --no-controllable to force Hi-Fi for one run even if "
+                         "voice.json sets controllable: true).")
     pre = argparse.ArgumentParser(add_help=False)
-    pre.add_argument("--config", type=Path, default=Path("voice.json"))
+    pre.add_argument("--config", type=Path, default=default_config_path)
     config = load_voice_config(pre.parse_known_args()[0].config)
     applied = apply_config_defaults(ap, config, CONFIGURABLE)
     if "lora" in applied:
@@ -901,8 +903,6 @@ def main():
             print("Regrounding: OFF (pure carry-over — timbre may drift).\n")
 
     # ── generate chunks ────────────────────────────────────────────────────
-    import time
-
     n_total = len(chunks)
     n_to_generate = sum(1 for c in chunks if int(c["id"]) >= args.start_at)
     if only_chunks is not None:
