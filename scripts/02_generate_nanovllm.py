@@ -66,6 +66,12 @@ Usage:
     python 02_generate_nanovllm.py --plan plan.json --lora ... --reference ... \\
         --out-dir ... --cfg 2.0 --timesteps 30 --prosody-tail 6.0
 
+    # generate 3 candidate takes of chunk 7 (chunk_0007_v1..v3.wav), plain
+    # file untouched -- listen and record your pick in selection.json, no
+    # need for --interactive
+    python 02_generate_nanovllm.py --plan plan.json --lora ... --reference ... \\
+        --out-dir ... --only-chunks 7 --candidates 3
+
 Requires: nano-vllm-voxcpm, soundfile, torchaudio, faster-whisper, jiwer
     pip install nano-vllm-voxcpm soundfile torchaudio faster-whisper jiwer
 """
@@ -345,7 +351,16 @@ def generate_with_retry(
         attempts = attempt
         wav = _generate_once(ref_latents)
         wav = trim_silence(wav, sample_rate)
-        audio_seconds = len(wav) / sample_rate
+        # The duration gate must judge the TRUE spoken length, not the
+        # safety-capped trim above (max_trim_ms=800 by design, so it never
+        # eats real speech) -- for a genuine runaway with >800ms of trailing
+        # junk, that cap leaves residual silence in `wav`, which previously
+        # made the gate's own measurement read longer than what 03_stitch.py
+        # (whose trim is uncapped) keeps, causing false "runaway" flags and
+        # wasted retries on chunks that were already fine. Re-trim (uncapped)
+        # a COPY purely for measurement; `wav` itself -- what's transcribed,
+        # kept, and written to disk -- is unchanged.
+        audio_seconds = len(trim_silence(wav, sample_rate, max_trim_ms=60_000)) / sample_rate
 
         if asr_model is not None:
             transcript = _transcribe(asr_model, wav, sample_rate)
@@ -614,6 +629,14 @@ def main():
                          "--out-dir. The manifest is preserved; only the named "
                          "chunks' audio is replaced. Use this to fix a few bad "
                          "chunks without re-running the whole column.")
+    ap.add_argument("--candidates", type=int, default=None,
+                    help="Requires --only-chunks. Instead of overwriting the plain "
+                         "chunk_NNNN.wav for each named chunk, generate this many "
+                         "candidate takes as chunk_NNNN_v1.wav..vK.wav (the plain "
+                         "file is left untouched). Listen and record your pick in "
+                         "selection.json, e.g. {\"7\": 2}, then re-run 03_stitch.py. "
+                         "Same idea as --interactive's 'cand' command, without "
+                         "needing to go interactive.")
     ap.add_argument("--controllable", action=argparse.BooleanOptionalAction, default=False,
                     help="Use Controllable Cloning instead of Hi-Fi. Drops the "
                          "reference transcript (timbre via encoded latents only) "
@@ -740,6 +763,13 @@ def main():
                      f"got {args.only_chunks!r}")
         if not only_chunks:
             sys.exit("--only-chunks was empty.")
+
+    if args.candidates is not None:
+        if only_chunks is None:
+            sys.exit("--candidates requires --only-chunks (which chunk(s) to generate "
+                      "candidates for).")
+        if args.candidates < 1:
+            sys.exit(f"--candidates must be >= 1; got {args.candidates}.")
 
     # ── validate inputs ────────────────────────────────────────────────────
     if not args.plan.exists():
@@ -1054,6 +1084,47 @@ def main():
         )
         if args.duration_gate:
             print(f"         [duration] target: {target_source}")
+
+        # --candidates: generate K versioned takes instead of one "kept" take.
+        # The plain chunk_NNNN.wav is left untouched (same contract as
+        # --interactive's 'cand' command); pick a winner via selection.json.
+        # Deliberately does NOT feed accepted_sec_per_word / prev_ref_latents /
+        # wer_log -- these are exploratory takes, not an accepted result.
+        if args.candidates:
+            print(f"[{cid:03d}/{n_total:03d}] generating {args.candidates} candidates "
+                  f"(chunk_{cid:04d}_v1..v{args.candidates}.wav; plain file untouched)")
+            for version in range(1, args.candidates + 1):
+                v_wav, v_wer, v_attempts, _tr, v_spw, v_dur_ok, v_dur_reason = generate_with_retry(
+                    server=server,
+                    text=target_text,
+                    prompt_id=prompt_id,
+                    ref_latents=chunk_ref_latents,
+                    zero_shot_latents=zero_shot_latents,
+                    cfg=args.cfg,
+                    temperature=args.temperature,
+                    max_generate_length=args.max_generate_length,
+                    lora_name=LORA_NAME,
+                    asr_model=asr_model,
+                    wer_threshold=args.wer_threshold,
+                    max_retries=args.max_retries,
+                    sample_rate=sample_rate,
+                    wer_reference=clean_for_wer(target_text),
+                    duration_gate=args.duration_gate,
+                    target_sec_per_word=target_sec_per_word,
+                    duration_floor=args.duration_floor,
+                    runaway_ratio=args.runaway_ratio,
+                    dragging_ratio=args.duration_ceiling,
+                )
+                version_path = args.out_dir / f"chunk_{cid:04d}_v{version}.wav"
+                sf.write(version_path, v_wav, sample_rate, subtype="PCM_16")
+                wer_str = f" WER={v_wer * 100:.1f}%" if v_wer >= 0 else ""
+                dur_str = f" {v_spw:.2f}s/word" if args.duration_gate else ""
+                print(f"         v{version}: {len(v_wav) / sample_rate:.1f}s{wer_str}"
+                      f"{dur_str} -> {version_path.name}")
+            print(f"         Listen to chunk_{cid:04d}_v1..v{args.candidates}.wav and "
+                  f"record your pick in selection.json (e.g. {{\"{cid}\": 2}}), "
+                  f"then re-run 03_stitch.py.")
+            continue
 
         wav, chunk_wer, attempts, accepted_transcript, sec_per_word, duration_ok, duration_reason = (
             generate_with_retry(

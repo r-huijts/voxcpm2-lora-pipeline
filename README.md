@@ -253,6 +253,13 @@ IDs in an existing `--out-dir`, leaving the rest untouched. `--interactive`
 keeps the model loaded after the run and drops into a prompt for fast one-off
 regeneration without a reload.
 
+**Trying a few takes of one chunk.** Prosody is stochastic — the same text can
+land differently across attempts, especially in Hi-Fi mode where control tags
+don't steer delivery at all. `--only-chunks 7 --candidates 3` generates three
+takes as `chunk_0007_v1.wav`..`v3.wav` without touching the plain
+`chunk_0007.wav` or needing `--interactive`. Listen, then record your pick in
+`selection.json` (`{"7": 2}`) and re-run `03_stitch.py`.
+
 **Running Stage 2 + 3 together.** Unlike chunk → generate, generate → stitch
 never needs a manual pause in between, so `scripts/generate_and_stitch.py`
 runs both with one command — it accepts every flag from both scripts, forwards
