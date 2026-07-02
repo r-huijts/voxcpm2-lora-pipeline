@@ -100,13 +100,23 @@ def test_single_candidate_unavailable_flagged_individually():
 
 
 def test_phonemize_nl_never_crashes_with_no_espeak_on_path():
+    # Clearing PATH alone isn't a reliable "espeak is unavailable" simulation:
+    # when the `phonemizer` package IS installed, it can find espeak-ng's
+    # shared library via ctypes (not a PATH-based subprocess lookup) even
+    # with PATH empty. Force the subprocess-only fallback path explicitly so
+    # this test is deterministic regardless of what's installed.
     import os
+    import lexicon_prefilter as lp
+
+    old_has_phonemizer = lp._HAS_PHONEMIZER
     old_path = os.environ.get("PATH", "")
+    lp._HAS_PHONEMIZER = False
     os.environ["PATH"] = "/nonexistent"
     try:
         result = phonemize_nl("klassementsman")
         assert result is None
     finally:
+        lp._HAS_PHONEMIZER = old_has_phonemizer
         os.environ["PATH"] = old_path
 
 

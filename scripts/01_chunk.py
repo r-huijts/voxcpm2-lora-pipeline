@@ -552,9 +552,11 @@ def main():
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--config", type=Path, default=Path("voice.json"))
     config = load_voice_config(pre.parse_known_args()[0].config)
-    apply_config_defaults(ap, config, CONFIGURABLE)
+    applied = apply_config_defaults(ap, config, CONFIGURABLE)
 
     args = ap.parse_args()
+    lexicon_from_config = "lexicon" in applied
+    lexicon_explicit_cli = "--lexicon" in sys.argv
 
     if not args.api_key:
         sys.exit("No Portkey API key. Pass --api-key or set PORTKEY_API_KEY.")
@@ -595,11 +597,21 @@ def main():
     lexicon = {}
     if not args.no_lexicon:
         lex_path = args.lexicon
-        default_lexicon_path = Path(__file__).resolve().parent / "lexicon.json"
-        if lex_path.exists() or lex_path != default_lexicon_path:
-            # Missing default lexicon is silently skipped; an explicitly
-            # passed missing path is an error (load_lexicon exits).
+        if lex_path.exists():
             lexicon = load_lexicon(lex_path)
+        elif lexicon_explicit_cli:
+            # The user explicitly typed --lexicon on the command line --
+            # a missing path there is a real error (load_lexicon exits).
+            lexicon = load_lexicon(lex_path)
+        else:
+            # Either the hardcoded default or a voice.json-supplied path --
+            # both are DEFAULTS, not explicit user intent, so a missing file
+            # is skipped with a warning rather than crashing the whole run
+            # (a voice.json path that's stale, or wrong for the cwd you
+            # happen to be running from, shouldn't halt chunking).
+            source = "voice.json" if lexicon_from_config else "default"
+            print(f"NOTE: lexicon not found at {lex_path} ({source}) -- "
+                  f"skipping lexicon.", file=sys.stderr)
 
     # Build source_text (raw, verbatim) and spoken_text (lexicon + deterministic
     # number/abbreviation normalization) for each chunk. The LLM never sees or
