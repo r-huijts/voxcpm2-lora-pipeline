@@ -149,6 +149,14 @@ The script then runs a **coverage check**: every pySBD sentence must appear in
 exactly one chunk, AND a self-check that concatenating every chunk's
 `source_text` reproduces the original column exactly (this catches bugs in the
 script's own chunk-building, since the LLM never touches wording at all).
+A coverage or round-trip failure is a **hard error**: the plan is still
+written so you can inspect it, but the script exits non-zero — a plan that
+drops or duplicates a sentence must never reach Stage 2 unnoticed. Lighter
+issues (odd gap values, a missing control tag) remain advisory warnings.
+
+Transient LLM-call failures (rate limits, timeouts, gateway 5xx) are retried
+up to 3 times with exponential backoff; permanent errors (bad key, unknown
+model) fail immediately.
 
 Produces `plan.json`. Each chunk carries:
 - `position`: `opening` | `continuing` | `final` — the chunk's role in the
@@ -234,7 +242,9 @@ either way for one transition with the previous chunk's `carryover_after: true
 **ASR quality gate.** After each chunk, faster-whisper transcribes it and jiwer
 scores Word Error Rate against the intended text; chunks over `--wer-threshold`
 (default 0.15) are regenerated up to `--max-retries` times and the best attempt
-is kept. Disable with `--no-asr`.
+is kept. Disable with `--no-asr`. If faster-whisper isn't installed the run
+stops with instructions rather than silently generating ungated — running
+without the WER gate must be a deliberate `--no-asr`, never an accident.
 
 **Duration-ratio gate.** WER checks words, not delivery — a chunk can score
 perfect WER while rushed, truncated, or "runaway" (VoxCPM's documented
@@ -247,6 +257,18 @@ per-voice pace target starts at a conservative built-in default and switches to
 the running median of accepted chunks after `--baseline-min-chunks` (default 5);
 override it directly with `--sec-per-word-target`. Disable entirely with
 `--no-duration-gate`.
+
+**Crash recovery.** `manifest.json` is written up front (its contents derive
+from the plan, not from generation), and every accepted chunk is appended —
+flushed to disk immediately — to `journal.jsonl` in `--out-dir`. A run killed
+mid-way (OOM, pod preemption, a runaway) therefore loses no bookkeeping:
+re-run with `--start-at N` and the finished chunks' WER entries and the
+duration-gate pace baseline are picked up from the journal, and the carry-over
+prosody tail is rebuilt from the last existing wav so the first resumed chunk
+keeps continuity. A fresh full run (no `--start-at`/`--only-chunks`) starts a
+new journal. The manifest carries a `generation_complete` flag (set only when
+the loop finishes); `03_stitch.py` warns when it's false, since a crashed
+run's listed wavs may be missing or left over from an earlier run.
 
 **Fixing individual chunks.** `--only-chunks 4,7` regenerates just those chunk
 IDs in an existing `--out-dir`, leaving the rest untouched. `--interactive`
@@ -296,7 +318,9 @@ ffmpeg -i final.wav -filter:a "atempo=0.85" final_slow.wav   # pitch preserved
 **Candidate selection.** If you generated multiple takes per chunk (Stage 2's
 interactive `cand` command), drop a `selection.json` (`{"3": 2, "4": 1}`,
 chunk id → chosen version) in `--run-dir` and it's picked up automatically, or
-point at one explicitly with `--selection`.
+point at one explicitly with `--selection`. A pick that names a take that
+doesn't exist on disk is a hard error — silently falling back to the plain
+file would ship exactly the take you rejected.
 
 **Every stitch also writes:**
 - `timeline.json` and `<output-stem>.srt`, next to `--output` — sample-accurate
@@ -316,7 +340,9 @@ point at one explicitly with `--selection`.
 - **Stage 1 is the only part that needs Portkey / an LLM.** Stages 2–3 are local
   to the pod and the model.
 - **Resume generation** with `--start-at N` if a long run is interrupted; the
-  manifest still records every chunk's gap so the stitcher has the full pattern.
+  manifest still records every chunk's gap so the stitcher has the full
+  pattern, and `journal.jsonl` restores the finished chunks' WER entries and
+  pace baseline (see Crash recovery above).
 - **The LoRA loader** reads the checkpoint's own `lora_config.json` to match the
   trained rank. Don't let it default.
 - **Control tags nudge, they don't command** — per the research, their effect on

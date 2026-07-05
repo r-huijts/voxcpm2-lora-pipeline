@@ -96,6 +96,7 @@ from _duration_gate import (
     select_best_attempt,
 )
 from _streaming import collect_chunks
+from _journal import append_chunk_record, journal_path, read_chunk_records, reset_journal
 
 # ── silence harmless third-party noise ─────────────────────────────────────
 # torch weight_norm deprecation, torchaudio TorchCodec-migration warnings, and
@@ -187,20 +188,22 @@ SEED_TEXT = (
 # ── ASR quality gate ───────────────────────────────────────────────────────
 
 def _load_asr(whisper_model: str):
-    """Lazy-load faster-whisper. Returns None if not installed."""
+    """Lazy-load faster-whisper. Hard-fails if missing: silently running
+    without the WER gate halves the quality checks without the user noticing.
+    Pass --no-asr to run without it deliberately."""
     try:
         from faster_whisper import WhisperModel
-        print(f"[asr] Loading faster-whisper '{whisper_model}'...")
-        model = WhisperModel(whisper_model, device="cuda", compute_type="float16")
-        print("[asr] Ready.\n")
-        return model
     except ImportError:
-        print(
-            "[asr] WARNING: faster-whisper not installed. ASR retry disabled.\n"
-            "         Install with: pip install faster-whisper jiwer",
-            file=sys.stderr,
+        sys.exit(
+            "[asr] faster-whisper is not installed, so the ASR/WER quality "
+            "gate cannot run.\n"
+            "      Install it:   pip install faster-whisper jiwer\n"
+            "      Or pass --no-asr to deliberately generate without the gate."
         )
-        return None
+    print(f"[asr] Loading faster-whisper '{whisper_model}'...")
+    model = WhisperModel(whisper_model, device="cuda", compute_type="float16")
+    print("[asr] Ready.\n")
+    return model
 
 
 def _transcribe(asr_model, audio: np.ndarray, sr: int) -> str:
@@ -210,6 +213,29 @@ def _transcribe(asr_model, audio: np.ndarray, sr: int) -> str:
     buf.seek(0)
     segments, _ = asr_model.transcribe(buf, language="nl", beam_size=5)
     return " ".join(s.text.strip() for s in segments).strip()
+
+
+def resolve_control(c: dict, args) -> str:
+    """The chunk's effective control tag after --no-control/--simple-control."""
+    control = c.get("control", "")
+    if args.no_control:
+        return ""
+    if args.simple_control is not None:
+        return args.simple_control
+    return control
+
+
+def wer_log_entry(cid: int, wer: float, attempts: int, sec_per_word: float,
+                  duration_ok: bool, duration_reason: str) -> dict:
+    """One chunk's wer_log.json entry -- also what goes in the journal."""
+    return {
+        "id": cid,
+        "wer": round(wer, 4) if wer >= 0 else None,
+        "attempts": attempts,
+        "sec_per_word": round(sec_per_word, 4) if sec_per_word else None,
+        "duration_ok": duration_ok,
+        "duration_reason": duration_reason,
+    }
 
 
 def _normalize_for_wer(text: str) -> str:
@@ -952,44 +978,93 @@ def main():
         "cfg": args.cfg,
         "items": [],
     }
+    # Every manifest field derives from the plan + flags, not from generation
+    # results -- so build ALL items and write manifest.json up front. A run
+    # that crashes partway then still leaves a complete manifest next to
+    # whatever wavs it managed to produce, instead of no manifest at all.
+    # generation_complete stays False until the loop finishes, so the stitcher
+    # can warn that some listed wavs may be missing or stale (e.g. left over
+    # from an earlier run into the same out-dir).
+    manifest["generation_complete"] = False
+    for c in chunks:
+        cid = int(c["id"])
+        manifest["items"].append({
+            "id": cid,
+            "file": f"chunk_{cid:04d}.wav",
+            "gap_after_ms": c.get("gap_after_ms", 300),
+            "control": resolve_control(c, args),
+            "source_text": resolve_source_text(c),
+            "spoken_text": resolve_spoken_text(c),
+        })
+    manifest_path = args.out_dir / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    # Per-chunk journal (journal.jsonl): appended + flushed as each chunk is
+    # accepted, so a crash mid-run loses no bookkeeping -- a resumed run
+    # (--start-at / --only-chunks) rebuilds finished chunks' wer_log entries
+    # and the duration baseline from it. A fresh full run supersedes whatever
+    # a previous run journaled into this out-dir.
+    jpath = journal_path(args.out_dir)
+    fresh_full_run = only_chunks is None and args.start_at <= 1
+    prior_journal = {} if fresh_full_run else read_chunk_records(jpath)
+    if fresh_full_run:
+        reset_journal(jpath)
+    elif prior_journal:
+        print(f"Journal: {len(prior_journal)} completed chunk(s) recorded by "
+              f"prior run(s) ({jpath.name}).")
 
     prev_ref_latents: bytes | None = None
     t_start = time.time()
     n_done = 0
     total_audio_s = 0.0
     total_retries = 0
-    wer_log = []  # (chunk_id, wer, attempts, sec_per_word, duration_ok, duration_reason)
+    wer_log = []  # list of wer_log_entry() dicts, one per generated chunk
     pron_diffs = []  # [{id, ref, heard, is_proper}, ...] across accepted chunks
 
-    # Duration-gate baseline: seed from a prior run's wer_log.json if present
-    # (e.g. an --only-chunks rerun), so a small partial run still benefits
-    # from the full run's established pace instead of restarting at the
-    # conservative built-in default.
+    # Duration-gate baseline: seed from prior state in this out-dir (e.g. an
+    # --only-chunks rerun, or a crash resume), so a partial run still benefits
+    # from the established pace instead of restarting at the conservative
+    # built-in default. Per chunk id the journal outranks wer_log.json: the
+    # journal always reflects the most recent run to touch this out-dir (a
+    # fresh full run resets it), while wer_log.json can survive from a
+    # superseded earlier run.
     wer_log_path = args.out_dir / "wer_log.json"
-    accepted_sec_per_word: list[float] = []
+    seed_entries: dict[int, dict] = {}
     if wer_log_path.exists():
         try:
             prior_log = json.loads(wer_log_path.read_text(encoding="utf-8"))
-            accepted_sec_per_word = [
-                e["sec_per_word"] for e in prior_log.get("chunks", [])
-                if isinstance(e.get("sec_per_word"), (int, float))
-            ]
-            if accepted_sec_per_word:
-                print(f"Duration baseline seeded from prior run: "
-                      f"{len(accepted_sec_per_word)} chunk(s).")
-        except Exception:
-            pass
+            for e in prior_log.get("chunks", []):
+                seed_entries[int(e["id"])] = e
+        except Exception as e:
+            print(f"WARNING: could not seed duration baseline from "
+                  f"{wer_log_path.name}: {e}", file=sys.stderr)
+    for jcid, rec in prior_journal.items():
+        if rec.get("wer"):
+            seed_entries[jcid] = rec["wer"]
+    accepted_sec_per_word: list[float] = [
+        e["sec_per_word"] for e in seed_entries.values()
+        if isinstance(e.get("sec_per_word"), (int, float))
+    ]
+    if accepted_sec_per_word:
+        print(f"Duration baseline seeded from prior run(s): "
+              f"{len(accepted_sec_per_word)} chunk(s).")
+
+    def _encode_tail_from_wav(path: Path) -> bytes:
+        """Carry-over latents from an existing chunk wav's last prosody_tail s."""
+        existing, _sr = sf.read(path, dtype="float32")
+        if existing.ndim > 1:
+            existing = existing.mean(axis=1)
+        tail_samples = int(args.prosody_tail * sample_rate)
+        tail = existing[-tail_samples:] if existing.size > tail_samples else existing
+        return server.encode_latents(ndarray_to_wav_bytes(tail, sample_rate), "wav")
 
     for idx, c in enumerate(chunks):
         prev_c = chunks[idx - 1] if idx > 0 else None
         cid = int(c["id"])
         text = resolve_spoken_text(c)
-        control = c.get("control", "")
-
-        if args.no_control:
-            control = ""
-        elif args.simple_control is not None:
-            control = args.simple_control
+        control = resolve_control(c, args)
 
         # In Controllable mode the parenthetical is honoured by the model, so
         # prepend it to the text: "(dry, measured)De renner...". In Hi-Fi mode
@@ -1000,21 +1075,26 @@ def main():
         else:
             target_text = text
 
-        gap_after_ms = c.get("gap_after_ms", 300)
         wav_name = f"chunk_{cid:04d}.wav"
         wav_path = args.out_dir / wav_name
 
-        manifest["items"].append({
-            "id": cid,
-            "file": wav_name,
-            "gap_after_ms": gap_after_ms,
-            "control": control,
-            "source_text": resolve_source_text(c),
-            "spoken_text": text,  # already resolve_spoken_text(c), computed above
-        })
-
         if cid < args.start_at:
-            print(f"[{cid:03d}/{n_total:03d}] skipped (resume)")
+            # If this is the last skipped chunk before generation resumes,
+            # rebuild the carry-over tail from its existing wav so the first
+            # resumed chunk keeps prosody continuity across the crash/stop.
+            nxt = chunks[idx + 1] if idx + 1 < len(chunks) else None
+            resumes_next = nxt is not None and int(nxt["id"]) >= args.start_at
+            if resumes_next and wav_path.exists():
+                try:
+                    prev_ref_latents = _encode_tail_from_wav(wav_path)
+                    print(f"[{cid:03d}/{n_total:03d}] skipped (resume); "
+                          f"carry-over rebuilt from existing wav")
+                except Exception as e:
+                    prev_ref_latents = None
+                    print(f"[{cid:03d}/{n_total:03d}] skipped (resume); "
+                          f"WARNING could not read for carry-over: {e}")
+            else:
+                print(f"[{cid:03d}/{n_total:03d}] skipped (resume)")
             continue
 
         # --only-chunks: regenerate just the named chunks. For a chunk NOT in
@@ -1024,21 +1104,20 @@ def main():
         if only_chunks is not None and cid not in only_chunks:
             if wav_path.exists():
                 try:
-                    existing, _sr = sf.read(wav_path, dtype="float32")
-                    if existing.ndim > 1:
-                        existing = existing.mean(axis=1)
-                    tail_samples = int(args.prosody_tail * sample_rate)
-                    tail = existing[-tail_samples:] if existing.size > tail_samples else existing
-                    prev_ref_latents = server.encode_latents(
-                        ndarray_to_wav_bytes(tail, sample_rate), "wav"
-                    )
+                    prev_ref_latents = _encode_tail_from_wav(wav_path)
                     print(f"[{cid:03d}/{n_total:03d}] kept (existing); carry-over refreshed")
                 except Exception as e:
+                    # Stale latents from an OLDER chunk must not masquerade as
+                    # this chunk's prosody -- clear them; the next generated
+                    # chunk simply starts without a carry-over tail.
+                    prev_ref_latents = None
                     print(f"[{cid:03d}/{n_total:03d}] kept (existing); "
-                          f"WARNING could not read for carry-over: {e}")
+                          f"WARNING could not read for carry-over: {e}; "
+                          f"carry-over cleared")
             else:
+                prev_ref_latents = None
                 print(f"[{cid:03d}/{n_total:03d}] kept — but no existing wav at "
-                      f"{wav_name}; carry-over unchanged")
+                      f"{wav_name}; carry-over cleared")
             continue
 
         # Carry-over should only flow WITHIN a rhetorical thought: suppressed
@@ -1161,7 +1240,13 @@ def main():
         n_done += 1
         retries_this_chunk = attempts - 1
         total_retries += retries_this_chunk
-        wer_log.append((cid, chunk_wer, attempts, sec_per_word, duration_ok, duration_reason))
+        entry = wer_log_entry(cid, chunk_wer, attempts, sec_per_word,
+                              duration_ok, duration_reason)
+        wer_log.append(entry)
+
+        # Journal this chunk NOW (flushed to disk): if the run crashes later,
+        # its bookkeeping survives for the resumed run to pick up.
+        append_chunk_record(jpath, cid, entry)
 
         # Pronunciation diff from the ACCEPTED attempt's transcript only.
         if accepted_transcript:
@@ -1183,15 +1268,22 @@ def main():
         print(f"         audio={chunk_audio_s:.1f}s wall={chunk_wall:.1f}s "
               f"RTF={rtf:.2f}{wer_str}{retry_str} ETA={eta_str}")
 
-        # Encode tail for prosody carry-over.
-        tail_samples = int(args.prosody_tail * sample_rate)
-        tail = wav[-tail_samples:] if wav.size > tail_samples else wav
-        prev_ref_latents = server.encode_latents(
-            ndarray_to_wav_bytes(tail, sample_rate), "wav"
-        )
+        # Encode tail for prosody carry-over. A failure here must not kill the
+        # run (the chunk itself is already accepted and on disk) nor leave a
+        # stale tail -- clear it and continue.
+        try:
+            tail_samples = int(args.prosody_tail * sample_rate)
+            tail = wav[-tail_samples:] if wav.size > tail_samples else wav
+            prev_ref_latents = server.encode_latents(
+                ndarray_to_wav_bytes(tail, sample_rate), "wav"
+            )
+        except Exception as e:
+            prev_ref_latents = None
+            print(f"         WARNING could not encode carry-over tail: {e}; "
+                  f"carry-over cleared for next chunk", file=sys.stderr)
 
-    # ── write manifest ─────────────────────────────────────────────────────
-    manifest_path = args.out_dir / "manifest.json"
+    # ── mark generation complete ───────────────────────────────────────────
+    manifest["generation_complete"] = True
     manifest_path.write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -1206,44 +1298,39 @@ def main():
     if wer_log:
         # Duration data is independent of ASR, so this now writes even with
         # --no-asr; WER-specific fields are simply None in that case.
-        valid_wers = [e for e in wer_log if e[1] >= 0]
+        valid_wers = [e for e in wer_log if e["wer"] is not None]
         if valid_wers:
-            avg_wer = sum(e[1] for e in valid_wers) / len(valid_wers)
-            worst = max(valid_wers, key=lambda e: e[1])
+            avg_wer = sum(e["wer"] for e in valid_wers) / len(valid_wers)
+            worst = max(valid_wers, key=lambda e: e["wer"])
             print(f"ASR summary: avg WER={avg_wer * 100:.1f}% | "
                   f"total retries={total_retries} | "
-                  f"worst chunk={worst[0]} ({worst[1] * 100:.1f}% WER, "
-                  f"{worst[2]} attempts)")
+                  f"worst chunk={worst['id']} ({worst['wer'] * 100:.1f}% WER, "
+                  f"{worst['attempts']} attempts)")
 
-        duration_failures = [e for e in wer_log if not e[4]]
+        duration_failures = [e for e in wer_log if not e["duration_ok"]]
         if args.duration_gate and duration_failures:
-            runaways = [e for e in duration_failures if e[5] == "runaway"]
+            runaways = [e for e in duration_failures
+                        if e["duration_reason"] == "runaway"]
             print(f"Duration gate: {len(duration_failures)}/{len(wer_log)} chunk(s) "
                   f"never cleanly passed"
                   + (f" ({len(runaways)} RUNAWAY)" if runaways else "") + ".")
 
-        new_entries = {
-            cid: {
-                "id": cid,
-                "wer": round(w, 4) if w >= 0 else None,
-                "attempts": a,
-                "sec_per_word": round(spw, 4) if spw else None,
-                "duration_ok": dok,
-                "duration_reason": dreason,
-            }
-            for cid, w, a, spw, dok, dreason in wer_log
-        }
+        new_entries = {e["id"]: e for e in wer_log}
 
-        # In --only-chunks mode, merge the regenerated chunks' results into
-        # the existing wer_log rather than replacing the whole file with a
-        # partial one.
+        # Partial runs (--only-chunks, --start-at) must merge, not replace:
+        # first from the journal (covers chunks a crashed prior run completed
+        # but never got into wer_log.json), then from the prior wer_log.json
+        # itself (covers out-dirs from before the journal existed).
         merged = dict(new_entries)
-        if only_chunks is not None and wer_log_path.exists():
+        for jcid, rec in prior_journal.items():
+            if jcid not in merged and rec.get("wer"):
+                merged[jcid] = rec["wer"]
+        if not fresh_full_run and wer_log_path.exists():
             try:
                 prior = json.loads(wer_log_path.read_text(encoding="utf-8"))
-                for entry in prior.get("chunks", []):
-                    if entry["id"] not in merged:
-                        merged[entry["id"]] = entry
+                for prior_entry in prior.get("chunks", []):
+                    if prior_entry["id"] not in merged:
+                        merged[prior_entry["id"]] = prior_entry
             except Exception as e:
                 print(f"WARNING: could not merge prior wer_log: {e}")
 
@@ -1360,13 +1447,10 @@ def main():
             if not pw.exists():
                 return None
             try:
-                ex, _ = sf.read(pw, dtype="float32")
-                if ex.ndim > 1:
-                    ex = ex.mean(axis=1)
-                ts = int(args.prosody_tail * sample_rate)
-                tl = ex[-ts:] if ex.size > ts else ex
-                return server.encode_latents(ndarray_to_wav_bytes(tl, sample_rate), "wav")
-            except Exception:
+                return _encode_tail_from_wav(pw)
+            except Exception as e:
+                print(f"  WARNING could not rebuild carry-over from {pw.name}: "
+                      f"{e}; regenerating without carry-over")
                 return None
 
         def _regen(cid: int, cfg_v: float, temp_v: float, version: int | None = None):
@@ -1375,7 +1459,7 @@ def main():
                 print(f"  no chunk with id {cid} in the plan.")
                 return
             text = resolve_spoken_text(c)
-            control = c.get("control", "")
+            control = resolve_control(c, args)
             if args.controllable and control.strip():
                 target_text = apply_control(text, control)
             else:
@@ -1431,6 +1515,15 @@ def main():
             else:
                 outp = args.out_dir / f"chunk_{cid:04d}_v{version}.wav"
             sf.write(outp, wav, sample_rate, subtype="PCM_16")
+            if version is None:
+                # A canonical regen replaces chunk_NNNN.wav, so journal the new
+                # take's quality data too -- otherwise the journal (and any
+                # later merge into wer_log.json) certifies audio that is no
+                # longer on disk. Candidate takes (_vK) aren't journaled.
+                append_chunk_record(
+                    jpath, cid,
+                    wer_log_entry(cid, wer, att, spw, dok, dreason),
+                )
             wtxt = f" WER={wer*100:.1f}%" if wer >= 0 else ""
             print(f"  wrote {outp.name} ({len(wav)/sample_rate:.1f}s{wtxt})")
 
