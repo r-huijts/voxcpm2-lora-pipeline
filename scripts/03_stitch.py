@@ -122,7 +122,9 @@ def resolve_chunk_file(run_dir: Path, item: dict, selection: dict) -> Path:
     """
     Decide which wav to use for a chunk. If the chunk id has a pick in the
     selection map, use chunk_NNNN_v<K>.wav; otherwise the plain file from the
-    manifest. Falls back to the plain file if the selected candidate is missing.
+    manifest. A pick pointing at a missing file is a hard error -- silently
+    substituting the plain take would ship exactly the audio the pick was
+    meant to replace.
     """
     plain = run_dir / item["file"]
     cid = item.get("id")
@@ -134,9 +136,9 @@ def resolve_chunk_file(run_dir: Path, item: dict, selection: dict) -> Path:
     cand = run_dir / f"{stem}_v{version}.wav"
     if cand.exists():
         return cand
-    print(f"  WARNING chunk {cid}: selected v{version} not found "
-          f"({cand.name}); falling back to {plain.name}")
-    return plain
+    sys.exit(f"Chunk {cid}: selection picks v{version} but {cand.name} does "
+             f"not exist in {run_dir}. Fix selection.json (or regenerate the "
+             f"candidate with --only-chunks {cid} --candidates ...).")
 
 
 def main():
@@ -197,6 +199,16 @@ def main():
     items = manifest.get("items", [])
     if not items:
         sys.exit("Manifest has no items.")
+    # 02 writes the manifest before generating and flips this flag only when
+    # the loop finishes -- False means the run crashed or was interrupted, so
+    # some listed wavs may be missing or left over from an earlier run into
+    # the same out-dir. (Absent key = pre-flag manifest; no conclusion.)
+    if manifest.get("generation_complete") is False:
+        print("WARNING: the generating run did not finish "
+              "(generation_complete=false in manifest.json). Some chunk wavs "
+              "may be missing or stale from an earlier run -- resume "
+              "02_generate_nanovllm.py (--start-at) before shipping this "
+              "stitch.", file=sys.stderr)
 
     # Load the candidate selection map, if any.
     sel_path = args.selection
@@ -215,6 +227,13 @@ def main():
                 continue  # allow comment keys
             selection[int(k)] = int(v)
         print(f"Selection loaded ({len(selection)} picks) from {sel_path.name} ({sel_source})")
+        # A pick naming a chunk id that isn't in the manifest would otherwise
+        # be dropped without a trace -- the same silent-fallback failure mode
+        # as a missing candidate file, so it gets the same hard error.
+        unknown = sorted(set(selection) - {item.get("id") for item in items})
+        if unknown:
+            sys.exit(f"selection.json picks chunk id(s) {unknown} that are not "
+                     f"in the manifest -- fix the id(s) or remove the entries.")
 
     cfg = manifest.get("config", {})
     manifest_gap_scale = cfg.get("gap_scale", 1.0)

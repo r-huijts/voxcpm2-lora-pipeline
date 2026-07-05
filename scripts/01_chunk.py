@@ -40,6 +40,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 import pysbd
@@ -394,34 +395,76 @@ def build_client(api_key: str, config_id: str | None) -> Portkey:
     return Portkey(**kwargs)
 
 
-def call_llm(client: Portkey, model: str, sentences_block: str, style_profile: str) -> str:
-    """Single chat completion; returns raw assistant text."""
+# Error-message fragments that mark a TRANSIENT failure worth retrying with
+# backoff (rate limits, timeouts, gateway/server hiccups) -- as opposed to a
+# permanent one (bad key, bad model slug) where retrying just burns time.
+# HTTP status codes are matched on word boundaries so digits inside token
+# counts or request ids ("requested 43500 tokens", "req_429f...") don't
+# misclassify a permanent error as transient.
+_TRANSIENT_MARKERS = (
+    "rate limit", "rate_limit", "timeout", "timed out", "connection",
+    "overloaded", "temporarily", "server error", "service unavailable",
+)
+_TRANSIENT_CODE_RE = re.compile(r"\b(429|500|502|503|504)\b")
+
+
+def _is_transient(msg: str) -> bool:
+    return (any(n in msg for n in _TRANSIENT_MARKERS)
+            or bool(_TRANSIENT_CODE_RE.search(msg)))
+
+
+def call_llm(client: Portkey, model: str, sentences_block: str, style_profile: str,
+             attempts: int = 3, backoff_s: float = 2.0) -> str:
+    """
+    Single chat completion; returns raw assistant text.
+
+    Transient failures (rate limits, timeouts, 5xx) are retried up to
+    `attempts` times with exponential backoff; the original exception is
+    re-raised if all attempts fail. Permanent errors (bad key, unknown
+    model) raise immediately.
+    """
     messages = [
         {"role": "system", "content": build_system_prompt(style_profile)},
         {"role": "user", "content": sentences_block},
     ]
     # max_tokens for most providers; some newer OpenAI models need
-    # max_completion_tokens. Try both, mirroring the reference tester.
-    for limit in ({"max_tokens": 8000}, {"max_completion_tokens": 8000}):
-        try:
-            resp = client.chat.completions.create(
-                messages=messages, model=model, **limit
-            )
-            break
-        except Exception as e:
-            msg = str(e).lower()
-            retryable = any(
-                n in msg for n in (
-                    "max_tokens", "max_completion_tokens", "unsupported",
-                    "unknown parameter", "extra_forbidden",
+    # max_completion_tokens. A variant the provider rejects as an unknown/
+    # unsupported parameter is dropped for good -- no point re-sending it
+    # (a full-payload request) on every backoff attempt.
+    variants = [{"max_tokens": 8000}, {"max_completion_tokens": 8000}]
+    last_transient = None
+    for attempt in range(1, attempts + 1):
+        for limit in list(variants):
+            try:
+                resp = client.chat.completions.create(
+                    messages=messages, model=model, **limit
                 )
-            )
-            if not retryable:
-                raise
-    else:
-        raise RuntimeError("Both token-limit parameters were rejected.")
-
-    return resp.choices[0].message.content
+                return resp.choices[0].message.content
+            except Exception as e:
+                msg = str(e).lower()
+                param_rejected = any(
+                    n in msg for n in (
+                        "max_tokens", "max_completion_tokens", "unsupported",
+                        "unknown parameter", "extra_forbidden",
+                    )
+                )
+                if param_rejected:
+                    variants.remove(limit)
+                    continue  # next token-limit variant
+                if not _is_transient(msg):
+                    raise
+                last_transient = e
+                break  # transient: abandon this attempt, back off, retry
+        if not variants:
+            raise RuntimeError("Both token-limit parameters were rejected.")
+        if attempt < attempts:
+            delay = backoff_s * (2 ** (attempt - 1))
+            print(f"LLM call failed transiently ({last_transient}); retrying "
+                  f"in {delay:.0f}s ({attempt + 1}/{attempts})...",
+                  file=sys.stderr)
+            time.sleep(delay)
+    print(f"LLM call failed after {attempts} attempts.", file=sys.stderr)
+    raise last_transient
 
 
 def parse_plan(raw: str) -> dict:
@@ -443,13 +486,19 @@ def parse_plan(raw: str) -> dict:
 
 
 def validate_plan(plan: dict, expected_sentence_ids: set[str] | None = None,
-                   rows: list[dict] | None = None) -> list[str]:
-    """Return a list of warnings (empty if clean). Non-fatal sanity checks."""
+                   rows: list[dict] | None = None) -> tuple[list[str], list[str]]:
+    """
+    Return (warnings, errors). Warnings are advisory -- review before
+    generating. Errors break the pipeline's core invariant (every sentence
+    spoken exactly once, wording reproduced verbatim) and must gate the run:
+    the plan is still written for inspection, but the exit code is non-zero.
+    """
     warnings = []
+    errors = []
     chunks = plan.get("chunks", [])
     if not chunks:
-        warnings.append("No chunks returned.")
-        return warnings
+        errors.append("No chunks returned.")
+        return warnings, errors
     valid_positions = {"opening", "continuing", "final"}
     for i, c in enumerate(chunks):
         cid = c.get("id", i + 1)
@@ -478,12 +527,12 @@ def validate_plan(plan: dict, expected_sentence_ids: set[str] | None = None,
         extra = used_set - expected_sentence_ids
         dupes = {s for s in used if used.count(s) > 1}
         if missing:
-            warnings.append(f"Sentences dropped (not in any chunk): "
-                            f"{sorted(missing)}")
+            errors.append(f"Sentences dropped (not in any chunk): "
+                          f"{sorted(missing)}")
         if extra:
-            warnings.append(f"Unknown sentence IDs in chunks: {sorted(extra)}")
+            errors.append(f"Unknown sentence IDs in chunks: {sorted(extra)}")
         if dupes:
-            warnings.append(f"Sentences used more than once: {sorted(dupes)}")
+            errors.append(f"Sentences used more than once: {sorted(dupes)}")
     # Round-trip check: concatenating chunks' source_text (in narrative
     # order) must reproduce the original column's sentences exactly. This is
     # a self-check on the SCRIPT's own construction (build_source_text), not
@@ -501,13 +550,13 @@ def validate_plan(plan: dict, expected_sentence_ids: set[str] | None = None,
         rebuilt = " ".join(c.get("source_text", "") for c in ordered if c.get("source_text"))
         expected_full = " ".join(r["text"] for r in rows)
         if rebuilt != expected_full:
-            warnings.append(
+            errors.append(
                 "source_text round-trip check FAILED: concatenated chunks' "
                 "source_text does not exactly match the original column "
                 "sentences. This indicates a bug in chunk construction (not "
                 "the LLM) -- do not trust this plan until investigated."
             )
-    return warnings
+    return warnings, errors
 
 
 def main():
@@ -643,7 +692,8 @@ def main():
     plan["config"]["gap_scale"] = args.gap_scale
     plan["config"]["crossfade_ms"] = args.crossfade_ms
 
-    warnings = validate_plan(plan, expected_sentence_ids=expected_ids, rows=rows)
+    warnings, errors = validate_plan(plan, expected_sentence_ids=expected_ids,
+                                     rows=rows)
 
     args.output.write_text(
         json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -656,6 +706,13 @@ def main():
         print("\nWarnings (review before generating):")
         for w in warnings:
             print(f"  - {w}")
+    if errors:
+        print("\nERRORS -- this plan violates the every-sentence-exactly-once "
+              "invariant and must not be generated as-is:", file=sys.stderr)
+        for e in errors:
+            print(f"  - {e}", file=sys.stderr)
+        sys.exit(f"Plan written to {args.output} for inspection, but it is NOT "
+                 f"safe to generate. Fix the plan (or re-run chunking) first.")
     print(f"\nReview and edit {args.output}, then run 02_generate_nanovllm.py.")
 
 
