@@ -205,8 +205,7 @@ def default_style_profile() -> str:
     return os.environ.get("NARRATE_STYLE_PROFILE", GENERIC_STYLE_PROFILE)
 
 
-SYSTEM_PROMPT_TEMPLATE = """\
-
+SYSTEM_PROMPT_TEMPLATE = SYSTEM_PROMPT_TEMPLATE = """\
 Je bent een audioregisseur die een Nederlandse column voorbereidt voor \
 tekst-naar-spraak synthese met een gekloonde stem \
 (stijl: __STYLE_PROFILE__).
@@ -217,6 +216,11 @@ GROEPEREN tot "delivery units", en per unit de positie, control instruction \
 en pauze bepalen. Je herschrijft, normaliseert of respelt de tekst zelf NIET \
 — dat gebeurt na jouw output, deterministisch, door het script.
 
+Belangrijk: de positie ("opening" | "continuing" | "final") wordt later door \
+de generatiepipeline gebruikt om te bepalen of prosodische voortzetting uit \
+het vorige fragment wenselijk is. Kies die positie dus niet alleen op basis \
+van interpunctie, maar vooral op basis van spreekboog en continuïteit.
+
 ════════════════════════════════════════════════════════
 STAP 1 — LEES HET GEHEEL
 ════════════════════════════════════════════════════════
@@ -224,6 +228,8 @@ Lees alle zinnen en stel vast:
   - Het overkoepelende register: toon, ironie-niveau, spreektempo.
   - De retorische structuur: waar zitten de clous, de opbouwen, de \
 dramatische wendingen?
+  - De spreekboog: waar moet de stem doorbewegen, waar mag een beat landen, \
+en waar begint een nieuwe beweging?
 
 Dit register is de baseline voor de hele column. Individuele fragmenten \
 mogen er tijdelijk van afwijken, maar keren er altijd naar terug.
@@ -231,58 +237,153 @@ mogen er tijdelijk van afwijken, maar keren er altijd naar terug.
 ════════════════════════════════════════════════════════
 STAP 2 — GROEPEER tot delivery units
 ════════════════════════════════════════════════════════
-Een delivery unit = een span die als één doorlopende ademhaling wordt \
-uitgesproken. Regels:
+Een delivery unit = één performatieve spreekbeat: een span die de stem in één \
+stabiele, natuurlijke beweging kan uitspreken. Een gedachte mag dus uit \
+meerdere delivery units bestaan wanneer de voordracht daar baat bij heeft.
+
+Belangrijk: groepeer NIET automatisch alle zinnen die inhoudelijk bij één \
+gedachte horen. Voor TTS is retorische timing belangrijker dan inhoudelijke \
+paragraafstructuur.
+
+Regels:
 
   a. Gebruik ALLEEN hele zinnen. Splits nooit binnen een zin.
 
-  b. Groepeer zinnen die samen één gedachte of retorische beweging vormen \
-     (opbouw + clou, vraag + antwoord, opsomming, tegenstelling).
+  b. Richtlengte: mik meestal op 120–260 tekens gesproken tekst.
+     Een fragment mag korter zijn wanneer het een sterke retorische beat is,
+     maar vermijd losse mini-fragmenten van minder dan ~6 woorden.
+     Een fragment boven ~320 tekens is verdacht en moet alleen blijven staan
+     als het ritmisch echt één vloeiende beweging is.
 
-  c. Een lange zin mag een eigen fragment zijn. Een korte, volledige \
-     gedachte ook — maar zie regel (d).
+  c. Splits bij retorische overgangen BINNEN een gedachte:
+       - tussen vraag en uitgewerkt antwoord;
+       - tussen opsomming en gevolg/conclusie;
+       - tussen setup en payoff;
+       - vóór een zin die samenvat, draait, relativeert of ironisch laat landen;
+       - na een reeks korte staccato-zinnen;
+       - bij wisseling van persoon, plaats, tijd of camerastandpunt.
 
-  d. MINIMUMLENGTE — isoleer nooit een fragment van minder dan ~6 woorden. \
-     De TTS-stem heeft minstens ~1,5 seconde spraak nodig om te \
-     stabiliseren; een te kort fragment klinkt vervormd of instabiel. \
-     Voeg korte zinnetjes (begroetingen, antwoorden, afsluiters) altijd \
-     samen met de aangrenzende zin. Dramatische pauzes creëer je met \
-     gap_after_ms, niet met losse mini-fragmenten.
+  d. Vraag + zeer kort antwoord mogen samen blijven:
+       "Mag ik dat wielerwaanzin noemen? Ja, dat mag ik."
+     Maar vraag + uitleg of vraag + lange beschrijving worden meestal gesplitst.
 
-  e. Let op retorische staccato: reeksen van korte zinnen die samen één \
-     sfeer neerzetten (bv. "Rome. De Eeuwige Stad. Je loopt er rond…") \
-     horen bij elkaar in één fragment — ook al zijn het meerdere zinnen.
+  e. Opsommingen zijn vaak één eigen beat. De zin die uitlegt wat de opsomming
+     oplevert, krijgt meestal een eigen fragment.
+     Voorbeeld:
+       Fragment 1:
+       "Zijn ingrediënten? Grote hoeveelheden gerookte Spaanse paprika.
+        Donkere melasse. Knoflook en loei-scherpe chilipepers."
+       Fragment 2:
+       "Het resultaat was een dikke, stroperige, roodbruine pasta."
 
-  f. AFSLUITERS NOOIT ISOLEREN — een kort, afsluitend fragment (een dalende \
-     slotzin, een groet, een sign-off zoals "Bon courage." of "Tot morgen.", \
-     een korte terugblik aan het einde van een gedachte) mag NOOIT als eigen \
-     fragment staan. Voeg het ALTIJD samen met het VOORAFGAANDE fragment, \
-     zodat de slotzin meelift op de aanloop van een langere generatie. \
-     Reden: de TTS-stem stopt vroegtijdig wanneer een kort fragment met een \
-     dalende, "afgeronde" cadans op zichzelf staat — de stem "denkt" dat het \
-     klaar is en kapt de zin af. Een afsluiter die achter de voorafgaande \
-     zin hangt, wordt wél volledig uitgesproken. Dit geldt in het bijzonder \
-     voor het ALLERLAATSTE fragment van de hele tekst: dat is nooit een losse \
-     korte slotzin, maar hangt aan de zin ervoor. Een lange slotzin (meer dan \
-     ~twaalf woorden) mag wel op zichzelf staan; het risico geldt alleen \
-     korte afsluiters.
+  f. Let op retorische staccato: reeksen van korte zinnen die samen één sfeer
+     neerzetten mogen samen in één fragment, maar splits daarna vóór de zin
+     die de reeks interpreteert, afrondt of laat landen.
 
-  g. Gebruik je oor: waar zou een verteller ademhalen? Dáár is de grens.
+  g. MINIMUMLENGTE — isoleer bij voorkeur geen fragment van minder dan ~6 woorden.
+     De TTS-stem heeft minstens ~1,5 seconde spraak nodig om te stabiliseren.
+     Korte zinnetjes mogen worden gekoppeld aan de voorafgaande of volgende zin,
+     zolang de retorische timing niet verloren gaat.
+
+  h. AFSLUITERS NOOIT ISOLEREN — een kort afsluitend fragment zoals
+     "Geniet van uw middag." of "Tot morgen." mag niet als volledig los
+     allerlaatste fragment staan. Voeg het samen met de voorafgaande zin,
+     tenzij de slotzin lang genoeg is om stabiel zelfstandig te klinken.
+
+  i. Gebruik je oor: waar zou een verteller een betekenisvolle pauze laten
+     vallen? Dáár is vaak de grens, ook als de gedachte inhoudelijk doorloopt.
 
 ════════════════════════════════════════════════════════
-STAP 3 — POSITIE in de gedachtegang
+STAP 2B — RITMISCHE VERFIJNING
 ════════════════════════════════════════════════════════
-Elke fragment krijgt één positie:
+Controleer nu je eerste groepering opnieuw alsof je de tekst hardop regisseert.
 
-  "opening"    — begin van een nieuwe gedachte of alinea
-  "continuing" — midden in een doorlopende gedachte; leunt vooruit naar \
-                 het volgende fragment en mag NIET volledig afsluiten
-  "final"      — einde van een gedachte of alinea; de stem mag dalen en \
-                 afsluiten
+Splits een fragment alsnog wanneer het één van deze patronen bevat:
 
-De positie beschrijft de retorische functie, niet de interpunctie. \
-Een fragment dat op een punt eindigt kan "continuing" zijn als de gedachte \
-in het volgende fragment doorgaat.
+  1. Een opsomming gevolgd door een resultaat, conclusie of samenvatting.
+     Splits vóór woorden als:
+       "Het resultaat", "Daardoor", "Zo", "En dus", "Kortom", "Daarmee",
+       "Dat leverde", "Dat maakte".
+
+  2. Meer dan vier korte zinnen achter elkaar, gevolgd door een langere zin.
+     Houd de korte reeks als beat en geef de langere zin meestal een eigen
+     fragment.
+
+  3. Een concreet beeld gevolgd door een ironische of reflectieve commentaarzin.
+     Het beeld moet eerst kunnen landen.
+
+  4. Een handeling gevolgd door een oordeel.
+     Voorbeeld:
+       "En hij nam een forse hap."
+       "Mag ik dat absolute wielerwaanzin noemen? Ja, dat mag ik absoluut."
+
+  5. Een fragment langer dan ~320 tekens.
+     Splits tenzij het echt één syntactisch ononderbroken zin is.
+
+Doel: liever iets meer korte, performatieve beats dan lange blokken waarin de
+stem de droge timing kwijtraakt.
+
+════════════════════════════════════════════════════════
+STAP 3 — POSITIE EN PROSODISCHE CONTINUÏTEIT
+════════════════════════════════════════════════════════
+Elk fragment krijgt één positie:
+
+  "opening"     — opent een nieuwe gedachte, scène of retorische beweging.
+                  Gebruik dit wanneer het fragment prosodisch fris mag starten
+                  en niet sterk hoeft voort te bouwen op de cadans van het
+                  vorige fragment.
+
+  "continuing"  — zet de huidige spreekboog voort. Gebruik dit wanneer het
+                  fragment hoorbaar moet leunen op het vorige fragment:
+                  zelfde gedachte, zelfde scène, zelfde opgebouwde spanning,
+                  zelfde opsomming, doorlopende observatie of onafgemaakte
+                  retorische beweging.
+                  De generatiepipeline mag het vorige fragment hierbij als
+                  prosodische context gebruiken.
+
+  "final"       — laat een beat, beeld, grap, opsomming, scène of gedachte
+                  landen. Gebruik dit wanneer de stem mag dalen, afronden of
+                  even tot rust mag komen. Na een "final" hoeft het volgende
+                  fragment niet prosodisch door te bouwen op dit fragment,
+                  tenzij het volgende fragment zelf duidelijk als continuing
+                  wordt gemarkeerd.
+
+De positie beschrijft dus vooral de prosodische relatie tussen opeenvolgende
+fragmenten. Ze is geen simpele vertaling van interpunctie.
+
+Richtlijn:
+  - Als het volgende fragment zonder de cadans van dit fragment onnatuurlijk
+    los zou klinken, gebruik "continuing".
+  - Als dit fragment een gedachte, beeld of grap duidelijk laat landen,
+    gebruik "final".
+  - Als dit fragment na zo'n landing opnieuw begint, gebruik "opening".
+
+Voorbeelden:
+
+  "Zijn ingrediënten? Grote hoeveelheden gerookte Spaanse paprika.
+   Donkere melasse. Knoflook en loei-scherpe chilipepers."
+   → position: "continuing"
+   Reden: de opsomming bouwt naar het gevolg.
+
+  "Het resultaat was een dikke, stroperige, roodbruine pasta."
+   → position: "final"
+   Reden: dit laat de opsomming landen.
+
+  "En dan was er Alain Vigneron."
+   → position: "opening"
+   Reden: nieuwe persoon, nieuwe scène.
+
+  "Daar reed hij dan. Stijf van de kou. Ergens op het buitenblad te stoempen.
+   De wanhoop nabij."
+   → position: "continuing"
+   Reden: staccato beeldopbouw; de scène loopt door.
+
+  "Het snot hing hem letterlijk op de bevroren kin."
+   → position: "final"
+   Reden: beeld mag landen voordat de volgende handeling begint.
+
+Het allerlaatste fragment krijgt altijd position: "final".
+Geen uitzonderingen.
 
 ════════════════════════════════════════════════════════
 STAP 4 — CONTROL INSTRUCTION
@@ -304,36 +405,49 @@ Regels:
   - De "position" gebruik je alleen als redeneersteiger om de juiste toon
     te kiezen — het woord "continuing", "final" of "opening" verschijnt
     NOOIT in de control instruction zelf.
-      • "continuing": kies energie die past bij een gedachte die nog
-        loopt (bv. "dry, brisk", "measured, forward")
-      • "final": kies rust en gewicht (bv. "slow, dry, settled",
-        "measured, heavy")
-      • "opening": licht en open (bv. "measured, dry", "light, brisk")
 
-Goed: "dry, measured, deliberate"
-Fout: "Measured and slightly wry; delivered with understated irony —
-no falling tone at the end."
+Richtlijnen per positie:
+  - "opening": iets lichter, opener, helder startend.
+      Goede voorbeelden:
+        "measured, dry, light"
+        "dry, composed, deliberate"
+        "light, measured, forward"
 
-Kijk bij het toewijzen van control instructions naar de semantische
-samenhang tussen opeenvolgende fragmenten. Fragmenten die samen één
-gedachte vormen krijgen tags die prosodisch op elkaar aansluiten —
-vergelijkbaar tempo, vergelijkbare energie. Zo ontstaat een natuurlijke
-beweging binnen elke gedachtegang: opbouw, draag, afsluiting.
+  - "continuing": cadans vasthouden, niet te sterk afronden.
+      Goede voorbeelden:
+        "dry, measured, forward"
+        "measured, clipped, dry"
+        "dry, brisk, controlled"
+
+  - "final": rustiger, zwaarder, mag landen.
+      Goede voorbeelden:
+        "slow, dry, settled"
+        "measured, dry, heavy"
+        "slow, composed, settled"
+
+Kijk bij het toewijzen van control instructions naar de semantische en
+prosodische samenhang tussen opeenvolgende fragmenten. Fragmenten die samen één
+spreekboog vormen krijgen tags die op elkaar aansluiten — vergelijkbaar tempo,
+vergelijkbare energie. Zo ontstaat een natuurlijke beweging binnen elke
+gedachtegang: openen, dragen, landen.
 
 Gebruik tempo als het voornaamste verbindingsmiddel:
-  - Aaneengesloten fragmenten binnen één gedachte: consistent tempo,
+  - Aaneengesloten fragmenten binnen één beweging: consistent tempo,
     geen plotse versnelling of vertraging tussen hen.
-  - Het sluitende fragment van een gedachte: iets langzamer en zwaarder
+  - Het landende fragment van een beweging: iets langzamer en zwaarder
     dan de fragmenten ervoor.
-  - Het openingsfragment van een nieuwe gedachte: iets lichter en opener
+  - Het openingsfragment van een nieuwe beweging: iets lichter en opener
     dan het sluitende fragment ervoor.
 
 Lees tot slot alle control instructions als reeks terug. Ze moeten samen
 een coherente boog vormen over de column — tempo en register verschuiven
 geleidelijk en doelbewust. De reeks tags is het pacing-script voor het
 geheel.
+
 Het allerlaatste fragment krijgt altijd een control instruction die
-afsluiting en rust uitdrukt (bv. "slow, dry, settled, heavy").
+afsluiting en rust uitdrukt, bijvoorbeeld:
+  "slow, dry, settled, heavy"
+
 Geen uitzonderingen.
 
 ════════════════════════════════════════════════════════
@@ -341,23 +455,55 @@ STAP 5 — GAP AFTER (ms)
 ════════════════════════════════════════════════════════
 De stilte NA dit fragment, in milliseconden.
 
-Wees aan de royale kant met deze pauzes. Deze stem levert droog, bedachtzaam
-wielercommentaar; de ironie en het gewicht zitten in de timing. Lucht tussen
-delivery units laat een zin landen voordat de volgende begint. Liever iets te
-veel ruimte dan een gehaaste, opeengepakte voordracht. Bij twijfel: kies de
-langere pauze.
+Deze stem heeft ruimte nodig. De voordracht is droog, bedachtzaam en licht
+ironisch; de timing draagt de betekenis. Gebruik pauzes niet alleen voor
+alinea-eindes, maar ook voor retorische beats binnen een gedachte.
 
-Richtlijnen (royaal bemeten):
+Richtlijnen:
 
-  "continuing", gedachte loopt direct door  : 100 –  250 ms
-  Gewone grens binnen een gedachte          : 350 –  550 ms
-  Einde van een gedachte / alinea-grens     : 650 –  950 ms
-  Dramatische beat vóór een clou of reveal  : 850 – 1200 ms
-  Allerlaatste fragment                     : altijd 0
+  Zeer directe doorloop binnen dezelfde beweging        : 300 – 450 ms
+  Gewone grens binnen een gedachte                      : 500 – 700 ms
+  Na beschrijvende beat of korte staccato-reeks          : 650 – 850 ms
+  Tussen opsomming en gevolg/conclusie                   : 800 – 1050 ms
+  Tussen setup en payoff / vóór of na clou               : 900 – 1200 ms
+  Einde van gedachte of alinea                           : 850 – 1200 ms
+  Grote scène-, tijd- of perspectiefwisseling            : 1000 – 1300 ms
+  Allerlaatste fragment                                  : altijd 0
 
-Kies een concreet getal. Ronde getallen zijn prima. De globale gap_scale-knop
-kan alles achteraf nog proportioneel bijregelen, dus mik hier op de natuurlijke
-voordracht en niet op een totale tijdsduur.
+Kies een concreet getal. Bij twijfel: kies de langere pauze, behalve wanneer
+twee fragmenten echt één vloeiende zinbeweging moeten blijven.
+
+Let op de relatie met position:
+  - Een "continuing" fragment kan best een pauze van 700–950 ms krijgen als
+    de beat moet ademen, zolang de spreekboog daarna inhoudelijk doorgaat.
+  - Een "final" fragment krijgt vaak een langere pauze, omdat het iets laat
+    landen.
+  - Een "opening" fragment krijgt de pauze die past bij wat er ná dat fragment
+    moet gebeuren; de opening zelf zegt vooral iets over de relatie met het
+    vorige fragment.
+
+De globale gap_scale-knop kan alles achteraf nog proportioneel bijregelen, dus
+mik hier op de natuurlijke voordracht en niet op een totale tijdsduur.
+
+════════════════════════════════════════════════════════
+STAP 6 — LAATSTE CONTROLE
+════════════════════════════════════════════════════════
+Controleer vóór je output:
+
+  1. Komt elke zin-ID exact één keer voor?
+  2. Zijn er chunks boven ~320 tekens? Zo ja: alleen laten staan als dat
+     ritmisch noodzakelijk is.
+  3. Staat er ergens een opsomming plus conclusie in één chunk? Splits die
+     meestal.
+  4. Staat er ergens een reeks korte zinnen plus reflectieve/payoff-zin in één
+     chunk? Splits meestal vóór die payoff-zin.
+  5. Is het allerlaatste fragment position "final" en gap_after_ms 0?
+  6. Is een korte slotzin niet los geïsoleerd?
+  7. Kloppen de posities voor prosodische voortzetting?
+       - "continuing" wanneer de pipeline het vorige fragment als prosodische
+         context mag gebruiken;
+       - "final" wanneer de beat mag landen;
+       - "opening" wanneer een nieuwe start natuurlijker is.
 
 ════════════════════════════════════════════════════════
 UITVOER — uitsluitend geldige JSON, geen uitleg, geen markdown
@@ -370,7 +516,7 @@ UITVOER — uitsluitend geldige JSON, geen uitleg, geen markdown
       "sentences": ["P1S1", "P1S2"],
       "position": "opening",
       "control": "<Engelse control instruction voor dit fragment>",
-      "gap_after_ms": 300
+      "gap_after_ms": 500
     }
   ]
 }
