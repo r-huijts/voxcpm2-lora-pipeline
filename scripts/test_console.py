@@ -190,6 +190,48 @@ def test_command_table_lists_all_commands():
         assert cmd in out
 
 
+def test_chunk_header_has_leading_blank_line_for_separation():
+    console = _record()
+    c.info("previous chunk's tail line")
+    c.chunk_header(5, 29, True, "", "", "", "next chunk text")
+    lines = console.export_text().splitlines()
+    idx = next(i for i, l in enumerate(lines) if "[005/029]" in l)
+    assert lines[idx - 1].strip() == "", "expected a blank line before the chunk header"
+
+
+def test_rule_has_blank_lines_on_both_sides():
+    console = _record()
+    c.info("before")
+    c.rule("Section")
+    c.info("after")
+    lines = console.export_text().splitlines()
+    rule_idx = next(i for i, l in enumerate(lines) if "Section" in l)
+    assert lines[rule_idx - 1].strip() == ""
+    assert lines[rule_idx + 1].strip() == ""
+
+
+def test_show_candidate_table_is_indented_and_framed():
+    console = _record()
+    ranked = [{"version": 1, "wer": 0.0, "sec_per_word": 0.3, "duration_ok": True,
+               "duration_reason": "ok", "flags": [], "metrics": {"duration_s": 5.0}}]
+    c.info("prior line")
+    c.show_candidate_table(9, ranked)
+    c.info("next line")
+    out = console.export_text()
+    lines = out.splitlines()
+    assert any(l.strip() == "" for l in lines)  # framed by blank lines
+    table_lines = [l for l in lines if "v1" in l]
+    assert table_lines and table_lines[0].startswith("  "), "expected a left margin"
+
+
+def test_show_command_table_has_left_margin():
+    console = _record()
+    c.show_command_table()
+    out = console.export_text()
+    line = next(l for l in out.splitlines() if "<id>" in l)
+    assert line.startswith("  ")
+
+
 def main():
     tests = [
         test_bracket_prefixes_render_as_literal_text_not_markup,
@@ -209,6 +251,10 @@ def main():
         test_candidate_take_line_with_flags,
         test_metrics_advisory_line,
         test_command_table_lists_all_commands,
+        test_chunk_header_has_leading_blank_line_for_separation,
+        test_rule_has_blank_lines_on_both_sides,
+        test_show_candidate_table_is_indented_and_framed,
+        test_show_command_table_has_left_margin,
     ]
     failures = 0
     for test in tests:

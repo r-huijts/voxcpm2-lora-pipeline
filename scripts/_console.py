@@ -19,6 +19,7 @@ text legitimately contains inline [non-verbal] tags (see _TAG_RE in
 interpret them as style tags.
 """
 from rich.console import Console
+from rich.padding import Padding
 from rich.table import Table
 from rich.text import Text
 
@@ -59,12 +60,30 @@ def plain(msg: str, indent: str = "") -> None:
     console.print(indent + msg, markup=False)
 
 
+def blank() -> None:
+    """One blank output line -- named so call sites read as intentional
+    paragraph breaks, not stray print()s."""
+    console.print()
+
+
 def rule(title: str = "") -> None:
+    """A section divider with breathing room on both sides -- otherwise the
+    line right above and right below a rule sit flush against it."""
+    blank()
     console.rule(title, style="cyan")
+    blank()
 
 
 def chunk_header(cid: int, n_total: int, carry_ok: bool, carry_note: str,
                   ctrl_str: str, reground_tag: str, text_preview: str) -> None:
+    """
+    Leads with a blank line: with 20-30+ chunks per run, back-to-back chunk
+    blocks with zero vertical separation read as one solid wall of text.
+    One blank line between chunks (and, via the leading blank, between the
+    last chunk's tail and the next chunk's header) is enough to let the eye
+    find chunk boundaries without inflating the log length much.
+    """
+    blank()
     t = Text()
     t.append(f"[{cid:03d}/{n_total:03d}] ", style="bold cyan")
     t.append("carry=", style="dim")
@@ -174,7 +193,8 @@ def candidate_table(cid: int, ranked: list[dict]) -> Table:
     """
     table = Table(title=f"chunk {cid:04d} — {len(ranked)} candidate take(s), "
                         f"best listening order first",
-                  header_style="bold cyan", show_lines=False)
+                  header_style="bold cyan", show_lines=True, padding=(0, 2),
+                  title_style="bold")
     table.add_column("#", justify="right")
     table.add_column("take", justify="center")
     table.add_column("duration", justify="right")
@@ -197,10 +217,18 @@ def candidate_table(cid: int, ranked: list[dict]) -> Table:
     return table
 
 
+def show_candidate_table(cid: int, ranked: list[dict]) -> None:
+    """candidate_table(), framed with blank lines and a left margin so it
+    doesn't sit flush against the per-take lines above it."""
+    blank()
+    console.print(Padding(candidate_table(cid, ranked), (0, 0, 0, 2)))
+    blank()
+
+
 def command_table() -> Table:
     """Interactive-mode command reference, in place of six plain print()s."""
     table = Table(header_style="bold cyan", show_lines=False, box=None,
-                  padding=(0, 2, 0, 0))
+                  padding=(0, 3, 1, 0))
     table.add_column("command", style="bold")
     table.add_column("does")
     rows = [
@@ -215,3 +243,8 @@ def command_table() -> Table:
     for cmd, desc in rows:
         table.add_row(cmd, desc)
     return table
+
+
+def show_command_table() -> None:
+    """command_table(), with a left margin matching show_candidate_table()."""
+    console.print(Padding(command_table(), (0, 0, 1, 2)))

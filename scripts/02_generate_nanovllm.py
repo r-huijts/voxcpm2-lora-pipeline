@@ -98,9 +98,9 @@ from _duration_gate import (
 from _streaming import collect_chunks
 from _audio_metrics import compute_metrics, derive_flags, rank_candidates
 from _console import (
-    INDENT, INDENT2, candidate_table, candidate_take_line, chunk_header,
-    command_table, console, dim, duration_note, error, info,
-    metrics_advisory_line, metrics_warning, plain, quality_line, rule,
+    INDENT, INDENT2, blank, candidate_take_line, chunk_header, console, dim,
+    duration_note, error, info, metrics_advisory_line, metrics_warning,
+    plain, quality_line, rule, show_candidate_table, show_command_table,
     success, warn, warn_err,
 )
 from _journal import append_chunk_record, journal_path, read_chunk_records, reset_journal
@@ -1243,11 +1243,11 @@ def main():
                            ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-            console.print(candidate_table(cid, ranked))
+            show_candidate_table(cid, ranked)
             info(f"details: {cand_report_path.name}")
             dim(f"Listen to chunk_{cid:04d}_v1..v{args.candidates}.wav and "
                f"record your pick in selection.json (e.g. {{\"{cid}\": 2}}), "
-               f"then re-run 03_stitch.py.\n")
+               f"then re-run 03_stitch.py.")
             continue
 
         wav, chunk_wer, attempts, accepted_transcript, sec_per_word, duration_ok, duration_reason = (
@@ -1404,6 +1404,8 @@ def main():
         )
         info(f"WER log:  {wer_log_path}")
 
+    blank()
+
     # ── pronunciation diff ─────────────────────────────────────────────────
     # Words the model was asked to say that Whisper heard differently, from
     # ACCEPTED audio only. Manual fuel for building a respelling lexicon — the
@@ -1479,6 +1481,7 @@ def main():
         dim("Pronunciation diff: no mismatches found across accepted chunks "
            "(no pronunciation_diff.json/.txt written).")
 
+    blank()
     info(f"Manifest: {manifest_path}")
     success(f"Next: python scripts/03_stitch.py --run-dir {args.out_dir} "
            f"--output {args.out_dir / 'final.wav'}")
@@ -1505,6 +1508,8 @@ def main():
                 return None
 
         def _regen(cid: int, cfg_v: float, temp_v: float, version: int | None = None):
+            if version is None:
+                blank()  # separate this command's output from the last
             c = plan_lookup.get(cid)
             if c is None:
                 error(f"no chunk with id {cid} in the plan.", INDENT2)
@@ -1598,10 +1603,8 @@ def main():
 
         plan_lookup = _load_plan_lookup()
 
-        console.print()
         rule("INTERACTIVE MODE — model stays loaded")
-        console.print(command_table())
-        console.print()
+        show_command_table()
 
         while True:
             try:
