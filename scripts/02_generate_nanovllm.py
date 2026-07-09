@@ -1196,6 +1196,8 @@ def main():
                 f"(chunk_{cid:04d}_v1..v{args.candidates}.wav; plain file untouched)")
             cand_entries = []
             for version in range(1, args.candidates + 1):
+                if version > 1:
+                    blank()  # separate this take's [attempt]/[quality]/vN group from the last
                 v_wav, v_wer, v_attempts, _tr, v_spw, v_dur_ok, v_dur_reason = generate_with_retry(
                     server=server,
                     text=target_text,
@@ -1592,6 +1594,8 @@ def main():
             info(f"generating {k} candidates of chunk {cid} "
                 f"@ cfg={cfg_v} temp={temp_v} ...", INDENT2)
             for v in range(1, k + 1):
+                if v > 1:
+                    blank()
                 _regen(cid, cfg_v, temp_v, version=v)
             dim(f"done. Listen to chunk_{cid:04d}_v1.. and record your pick "
                f"in selection.json (e.g. {{\"{cid}\": 2}}).", INDENT2)
