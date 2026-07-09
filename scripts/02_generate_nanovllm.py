@@ -97,6 +97,12 @@ from _duration_gate import (
 )
 from _streaming import collect_chunks
 from _audio_metrics import compute_metrics, derive_flags, rank_candidates
+from _console import (
+    INDENT, INDENT2, candidate_table, candidate_take_line, chunk_header,
+    command_table, console, dim, duration_note, error, info,
+    metrics_advisory_line, metrics_warning, plain, quality_line, rule,
+    success, warn, warn_err,
+)
 from _journal import append_chunk_record, journal_path, read_chunk_records, reset_journal
 
 # ── silence harmless third-party noise ─────────────────────────────────────
@@ -201,9 +207,9 @@ def _load_asr(whisper_model: str):
             "      Install it:   pip install faster-whisper jiwer\n"
             "      Or pass --no-asr to deliberately generate without the gate."
         )
-    print(f"[asr] Loading faster-whisper '{whisper_model}'...")
+    info(f"[asr] Loading faster-whisper '{whisper_model}'...")
     model = WhisperModel(whisper_model, device="cuda", compute_type="float16")
-    print("[asr] Ready.\n")
+    success("[asr] Ready.\n")
     return model
 
 
@@ -255,7 +261,7 @@ def analyze_chunk_audio(wav, sr: int) -> tuple[dict | None, list[str]]:
         metrics = compute_metrics(wav, sr)
         return metrics, derive_flags(metrics)
     except Exception as e:
-        print(f"         [metrics] WARNING: waveform analysis failed: {e}")
+        metrics_warning(f"WARNING: waveform analysis failed: {e}")
         return None, []
 
 
@@ -428,8 +434,8 @@ def generate_with_retry(
             expected_seconds = words * target_sec_per_word if words else 0.0
 
         if dur_ok and check_dragging(audio_seconds, expected_seconds, dragging_ratio):
-            print(f"         [duration] NOTE: dragging ({sec_per_word:.2f}s/word, "
-                  f"{audio_seconds:.1f}s vs ~{expected_seconds:.1f}s expected) — informational only.")
+            duration_note(f"NOTE: dragging ({sec_per_word:.2f}s/word, "
+                          f"{audio_seconds:.1f}s vs ~{expected_seconds:.1f}s expected) — informational only.")
 
         attempts_data.append(dict(
             audio=wav, wer=current_wer, transcript=transcript,
@@ -445,8 +451,7 @@ def generate_with_retry(
         status = " ".join(status_bits)
 
         if wer_ok and dur_ok:
-            tag = "✓ accepted" if attempt > 1 else "✓"
-            print(f"         [quality] attempt {attempt}: {status} {tag}")
+            quality_line(attempt, status, passed=True, retrying=False)
             break
 
         reasons = []
@@ -455,19 +460,16 @@ def generate_with_retry(
         if not dur_ok:
             reasons.append("RUNAWAY (hit max length, no clean stop)"
                             if dur_reason == "runaway" else "too short/rushed")
-        if attempt <= max_retries:
-            print(f"         [quality] attempt {attempt}: {status} — "
-                  f"{', '.join(reasons)} — retrying...")
-        else:
-            print(f"         [quality] attempt {attempt}: {status} — "
-                  f"{', '.join(reasons)} — retries exhausted, keeping best")
+        quality_line(attempt, status, passed=False, retrying=(attempt <= max_retries),
+                    reasons=", ".join(reasons))
 
     best = select_best_attempt(attempts_data, target_sec_per_word)
     if not (best["wer_ok"] and best["dur_ok"]) and any(
         a["dur_reason"] == "runaway" for a in attempts_data
     ):
-        print(f"         [duration] RUNAWAY (hit max length, no clean stop) on all "
-              f"attempts — keeping least-bad ({best['sec_per_word']:.2f}s/word).")
+        duration_note(f"RUNAWAY (hit max length, no clean stop) on all "
+                      f"attempts — keeping least-bad ({best['sec_per_word']:.2f}s/word).",
+                      severe=True)
 
     return (best["audio"], best["wer"], attempts, best["transcript"],
             best["sec_per_word"], best["dur_ok"], best["dur_reason"])
@@ -794,11 +796,11 @@ def main():
     args = ap.parse_args()
 
     if not args.controllable and args.reground != "every":
-        print(f"WARNING: --reground {args.reground!r} is ignored in Hi-Fi mode "
-              f"(regrounding only applies with --controllable).", file=sys.stderr)
+        warn_err(f"WARNING: --reground {args.reground!r} is ignored in Hi-Fi mode "
+                f"(regrounding only applies with --controllable).")
     if args.reference_text.strip() and args.reference_text_file is not None:
-        print(f"NOTE: --reference-text-file ({args.reference_text_file}) overrides "
-              f"--reference-text.", file=sys.stderr)
+        warn_err(f"NOTE: --reference-text-file ({args.reference_text_file}) overrides "
+                f"--reference-text.")
 
     # Parse --only-chunks into a set of ints (or None for "all").
     only_chunks = None
@@ -847,14 +849,14 @@ def main():
     if not args.no_asr:
         asr_model = _load_asr(args.whisper_model)
         if asr_model is not None:
-            print(f"[asr] WER threshold={args.wer_threshold * 100:.0f}%  "
-                  f"max-retries={args.max_retries}\n")
+            info(f"[asr] WER threshold={args.wer_threshold * 100:.0f}%  "
+                f"max-retries={args.max_retries}\n")
 
     # ── load TTS model ─────────────────────────────────────────────────────
     lora_config = load_lora_config(args.lora)
-    print(f"LoRA config loaded from {lora_cfg_file.name}")
-    print(f"\nLoading {BASE_MODEL} + LoRA ({args.lora.name})...")
-    print("(First run will snapshot-download ~9 GB of weights.)\n")
+    info(f"LoRA config loaded from {lora_cfg_file.name}")
+    rule(f"Loading {BASE_MODEL} + LoRA ({args.lora.name})")
+    dim("(First run will snapshot-download ~9 GB of weights.)\n")
 
     server = VoxCPM.from_pretrained(
         model=BASE_MODEL,
@@ -870,14 +872,14 @@ def main():
 
     model_info = server.get_model_info()
     sample_rate = int(model_info["sample_rate"])
-    print(f"Model ready. Sample rate: {sample_rate} Hz")
+    success(f"Model ready. Sample rate: {sample_rate} Hz")
 
     LORA_NAME = "voice"
     server.register_lora(LORA_NAME, str(args.lora))
-    print(f"LoRA registered and active: '{LORA_NAME}' -> {args.lora}\n")
+    success(f"LoRA registered and active: '{LORA_NAME}' -> {args.lora}\n")
 
     # ── reference voice prompt ─────────────────────────────────────────────
-    print(f"Loading reference clip: {args.reference.name}")
+    info(f"Loading reference clip: {args.reference.name}")
     ref_bytes = wav_to_bytes(args.reference, sample_rate)
 
     reference_text = args.reference_text
@@ -885,25 +887,25 @@ def main():
         if not args.reference_text_file.exists():
             sys.exit(f"Reference text file not found: {args.reference_text_file}")
         reference_text = args.reference_text_file.read_text(encoding="utf-8").strip()
-        print(f"Reference transcript loaded from {args.reference_text_file.name} "
-              f"({len(reference_text)} chars)")
+        info(f"Reference transcript loaded from {args.reference_text_file.name} "
+            f"({len(reference_text)} chars)")
 
     if args.controllable and reference_text.strip():
-        print("--controllable set: ignoring reference transcript so per-chunk "
-              "control instructions stay active (Controllable Cloning mode).")
+        dim("--controllable set: ignoring reference transcript so per-chunk "
+            "control instructions stay active (Controllable Cloning mode).")
         reference_text = ""
 
     if reference_text.strip():
         prompt_id = server.add_prompt(ref_bytes, "wav", reference_text)
         zero_shot_latents = None
-        print(f"Reference registered with transcript. prompt_id={prompt_id} "
-              f"(Hi-Fi mode — control instructions ignored)\n")
+        success(f"Reference registered with transcript. prompt_id={prompt_id} "
+               f"(Hi-Fi mode — control instructions ignored)\n")
     else:
         prompt_id = None
         zero_shot_latents = server.encode_latents(ref_bytes, "wav")
         mode = "Controllable Cloning" if args.controllable else "zero-shot"
-        print(f"Timbre via encoded latents ({mode} — control instructions "
-              f"active).\n")
+        success(f"Timbre via encoded latents ({mode} — control instructions "
+               f"active).\n")
 
     # ── regrounding setup (Controllable mode only) ─────────────────────────
     # The original reference latents anchor timbre; in Controllable mode they
@@ -933,7 +935,7 @@ def main():
         if n_floats % 64 == 0:
             feat_dim = 64
     if feat_dim is not None:
-        print(f"feat_dim={feat_dim} (for regrounding latent concatenation).")
+        dim(f"feat_dim={feat_dim} (for regrounding latent concatenation).")
 
     # Cap the regrounding anchor so [anchor + tail + long chunk] can't overflow
     # max_model_len. The reference clip is usually short, but a hard cap is
@@ -946,10 +948,10 @@ def main():
             cap = args.reground_anchor_frames
             if arr.shape[0] > cap:
                 ref_anchor_latents = arr[:cap].astype(np.float32).tobytes()
-                print(f"Reground anchor trimmed to first {cap} latent frames "
-                      f"(was {arr.shape[0]}).")
+                dim(f"Reground anchor trimmed to first {cap} latent frames "
+                    f"(was {arr.shape[0]}).")
         except Exception as e:
-            print(f"WARNING: could not trim reground anchor: {e}")
+            warn(f"WARNING: could not trim reground anchor: {e}")
 
     # Parse --reground into a mode: "every" | "off" | int N.
     reground_raw = str(args.reground).strip().lower()
@@ -967,29 +969,28 @@ def main():
 
     if args.controllable and ref_anchor_latents is not None:
         if feat_dim is None:
-            print("WARNING: could not read feat_dim from server; regrounding "
-                  "disabled (falling back to pure carry-over).")
+            warn("WARNING: could not read feat_dim from server; regrounding "
+                "disabled (falling back to pure carry-over).")
             reground_mode = "off"
         elif reground_mode == "every":
-            print("Regrounding: ORIGINAL reference re-anchored on EVERY chunk "
-                  "(reference + carry-over tail share the ref slot).\n")
+            info("Regrounding: ORIGINAL reference re-anchored on EVERY chunk "
+                "(reference + carry-over tail share the ref slot).\n")
         elif reground_mode == "n":
-            print(f"Regrounding: hard reset to ORIGINAL reference every "
-                  f"{reground_n} chunks; pure carry-over in between.\n")
+            info(f"Regrounding: hard reset to ORIGINAL reference every "
+                f"{reground_n} chunks; pure carry-over in between.\n")
         else:
-            print("Regrounding: OFF (pure carry-over — timbre may drift).\n")
+            warn("Regrounding: OFF (pure carry-over — timbre may drift).\n")
 
     # ── generate chunks ────────────────────────────────────────────────────
     n_total = len(chunks)
     n_to_generate = sum(1 for c in chunks if int(c["id"]) >= args.start_at)
     if only_chunks is not None:
-        print(f"REGENERATING ONLY chunks {sorted(only_chunks)} — all other "
-              f"existing wavs in {args.out_dir} are kept untouched.")
+        warn(f"REGENERATING ONLY chunks {sorted(only_chunks)} — all other "
+            f"existing wavs in {args.out_dir} are kept untouched.")
         n_to_generate = len(only_chunks)
-    print(f"Generating {n_total} chunks "
-          f"(cfg={args.cfg}, timesteps={args.timesteps}, "
-          f"temperature={args.temperature}, "
-          f"prosody_tail={args.prosody_tail}s)...\n")
+    rule(f"Generating {n_total} chunks")
+    info(f"cfg={args.cfg}, timesteps={args.timesteps}, "
+        f"temperature={args.temperature}, prosody_tail={args.prosody_tail}s\n")
 
     manifest = {
         "config": plan.get("config", {}),
@@ -1033,8 +1034,8 @@ def main():
     if fresh_full_run:
         reset_journal(jpath)
     elif prior_journal:
-        print(f"Journal: {len(prior_journal)} completed chunk(s) recorded by "
-              f"prior run(s) ({jpath.name}).")
+        info(f"Journal: {len(prior_journal)} completed chunk(s) recorded by "
+            f"prior run(s) ({jpath.name}).")
 
     prev_ref_latents: bytes | None = None
     t_start = time.time()
@@ -1059,8 +1060,8 @@ def main():
             for e in prior_log.get("chunks", []):
                 seed_entries[int(e["id"])] = e
         except Exception as e:
-            print(f"WARNING: could not seed duration baseline from "
-                  f"{wer_log_path.name}: {e}", file=sys.stderr)
+            warn_err(f"WARNING: could not seed duration baseline from "
+                    f"{wer_log_path.name}: {e}")
     for jcid, rec in prior_journal.items():
         if rec.get("wer"):
             seed_entries[jcid] = rec["wer"]
@@ -1069,8 +1070,8 @@ def main():
         if isinstance(e.get("sec_per_word"), (int, float))
     ]
     if accepted_sec_per_word:
-        print(f"Duration baseline seeded from prior run(s): "
-              f"{len(accepted_sec_per_word)} chunk(s).")
+        info(f"Duration baseline seeded from prior run(s): "
+            f"{len(accepted_sec_per_word)} chunk(s).")
 
     def _encode_tail_from_wav(path: Path) -> bytes:
         """Carry-over latents from an existing chunk wav's last prosody_tail s."""
@@ -1108,14 +1109,14 @@ def main():
             if resumes_next and wav_path.exists():
                 try:
                     prev_ref_latents = _encode_tail_from_wav(wav_path)
-                    print(f"[{cid:03d}/{n_total:03d}] skipped (resume); "
-                          f"carry-over rebuilt from existing wav")
+                    dim(f"[{cid:03d}/{n_total:03d}] skipped (resume); "
+                        f"carry-over rebuilt from existing wav")
                 except Exception as e:
                     prev_ref_latents = None
-                    print(f"[{cid:03d}/{n_total:03d}] skipped (resume); "
-                          f"WARNING could not read for carry-over: {e}")
+                    warn(f"[{cid:03d}/{n_total:03d}] skipped (resume); "
+                        f"WARNING could not read for carry-over: {e}")
             else:
-                print(f"[{cid:03d}/{n_total:03d}] skipped (resume)")
+                dim(f"[{cid:03d}/{n_total:03d}] skipped (resume)")
             continue
 
         # --only-chunks: regenerate just the named chunks. For a chunk NOT in
@@ -1126,19 +1127,19 @@ def main():
             if wav_path.exists():
                 try:
                     prev_ref_latents = _encode_tail_from_wav(wav_path)
-                    print(f"[{cid:03d}/{n_total:03d}] kept (existing); carry-over refreshed")
+                    dim(f"[{cid:03d}/{n_total:03d}] kept (existing); carry-over refreshed")
                 except Exception as e:
                     # Stale latents from an OLDER chunk must not masquerade as
                     # this chunk's prosody -- clear them; the next generated
                     # chunk simply starts without a carry-over tail.
                     prev_ref_latents = None
-                    print(f"[{cid:03d}/{n_total:03d}] kept (existing); "
-                          f"WARNING could not read for carry-over: {e}; "
-                          f"carry-over cleared")
+                    warn(f"[{cid:03d}/{n_total:03d}] kept (existing); "
+                        f"WARNING could not read for carry-over: {e}; "
+                        f"carry-over cleared")
             else:
                 prev_ref_latents = None
-                print(f"[{cid:03d}/{n_total:03d}] kept — but no existing wav at "
-                      f"{wav_name}; carry-over cleared")
+                warn(f"[{cid:03d}/{n_total:03d}] kept — but no existing wav at "
+                    f"{wav_name}; carry-over cleared")
             continue
 
         # Carry-over should only flow WITHIN a rhetorical thought: suppressed
@@ -1148,7 +1149,6 @@ def main():
         carry_ok, carry_reason = should_carry_over(prev_c, c)
         tail_latents = prev_ref_latents if carry_ok else None
 
-        ref_carry = "yes" if tail_latents else f"no ({carry_reason})"
         ctrl_str = f" ctrl='{control}'" if (args.controllable and control.strip()) else ""
 
         # ── decide what goes in the ref_audio_latents slot ─────────────────
@@ -1174,8 +1174,9 @@ def main():
             else:
                 chunk_ref_latents = tail_latents
 
-        print(f"[{cid:03d}/{n_total:03d}] ref_carry={ref_carry}{ctrl_str}{reground_tag} | "
-              f"{text[:55]}{'...' if len(text) > 55 else ''}")
+        chunk_header(cid, n_total, bool(tail_latents),
+                    "" if tail_latents else carry_reason, ctrl_str, reground_tag,
+                    text[:55] + ("..." if len(text) > 55 else ""))
 
         t_chunk = time.time()
 
@@ -1183,7 +1184,7 @@ def main():
             accepted_sec_per_word, args.sec_per_word_target, args.baseline_min_chunks,
         )
         if args.duration_gate:
-            print(f"         [duration] target: {target_source}")
+            dim(f"[duration] target: {target_source}", INDENT)
 
         # --candidates: generate K versioned takes instead of one "kept" take.
         # The plain chunk_NNNN.wav is left untouched (same contract as
@@ -1191,8 +1192,8 @@ def main():
         # Deliberately does NOT feed accepted_sec_per_word / prev_ref_latents /
         # wer_log -- these are exploratory takes, not an accepted result.
         if args.candidates:
-            print(f"[{cid:03d}/{n_total:03d}] generating {args.candidates} candidates "
-                  f"(chunk_{cid:04d}_v1..v{args.candidates}.wav; plain file untouched)")
+            info(f"[{cid:03d}/{n_total:03d}] generating {args.candidates} candidates "
+                f"(chunk_{cid:04d}_v1..v{args.candidates}.wav; plain file untouched)")
             cand_entries = []
             for version in range(1, args.candidates + 1):
                 v_wav, v_wer, v_attempts, _tr, v_spw, v_dur_ok, v_dur_reason = generate_with_retry(
@@ -1229,11 +1230,8 @@ def main():
                     "flags": v_flags,
                     "metrics": v_metrics,
                 })
-                wer_str = f" WER={v_wer * 100:.1f}%" if v_wer >= 0 else ""
-                dur_str = f" {v_spw:.2f}s/word" if args.duration_gate else ""
-                flag_str = f" [{', '.join(v_flags)}]" if v_flags else ""
-                print(f"         v{version}: {len(v_wav) / sample_rate:.1f}s{wer_str}"
-                      f"{dur_str}{flag_str} -> {version_path.name}")
+                candidate_take_line(version, len(v_wav) / sample_rate, v_wer, v_spw,
+                                    args.duration_gate, v_flags, version_path.name)
             # Pre-listening sort order (see _audio_metrics.rank_candidates):
             # a filter for where to START listening, not a verdict -- the ear
             # test still decides what goes in selection.json.
@@ -1245,12 +1243,11 @@ def main():
                            ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-            rank_str = " > ".join(f"v{e['version']}" for e in ranked)
-            print(f"         [metrics] suggested listening order: {rank_str} "
-                  f"(details: {cand_report_path.name})")
-            print(f"         Listen to chunk_{cid:04d}_v1..v{args.candidates}.wav and "
-                  f"record your pick in selection.json (e.g. {{\"{cid}\": 2}}), "
-                  f"then re-run 03_stitch.py.")
+            console.print(candidate_table(cid, ranked))
+            info(f"details: {cand_report_path.name}")
+            dim(f"Listen to chunk_{cid:04d}_v1..v{args.candidates}.wav and "
+               f"record your pick in selection.json (e.g. {{\"{cid}\": 2}}), "
+               f"then re-run 03_stitch.py.\n")
             continue
 
         wav, chunk_wer, attempts, accepted_transcript, sec_per_word, duration_ok, duration_reason = (
@@ -1316,11 +1313,10 @@ def main():
                    if chunk_wer >= 0 else "")
         retry_str = (f" retries={retries_this_chunk}"
                      if retries_this_chunk > 0 else "")
-        print(f"         audio={chunk_audio_s:.1f}s wall={chunk_wall:.1f}s "
-              f"RTF={rtf:.2f}{wer_str}{retry_str} ETA={eta_str}")
+        dim(f"audio={chunk_audio_s:.1f}s wall={chunk_wall:.1f}s "
+           f"RTF={rtf:.2f}{wer_str}{retry_str} ETA={eta_str}", INDENT)
         if audio_flags:
-            print(f"         [metrics] advisory: {', '.join(audio_flags)} "
-                  f"(triage hint, not a gate -- worth a listen)")
+            metrics_advisory_line(audio_flags)
 
         # Encode tail for prosody carry-over. A failure here must not kill the
         # run (the chunk itself is already accepted and on disk) nor leave a
@@ -1333,8 +1329,8 @@ def main():
             )
         except Exception as e:
             prev_ref_latents = None
-            print(f"         WARNING could not encode carry-over tail: {e}; "
-                  f"carry-over cleared for next chunk", file=sys.stderr)
+            warn_err(f"WARNING could not encode carry-over tail: {e}; "
+                    f"carry-over cleared for next chunk", INDENT)
 
     # ── mark generation complete ───────────────────────────────────────────
     manifest["generation_complete"] = True
@@ -1345,9 +1341,10 @@ def main():
     total_wall = time.time() - t_start
     avg_rtf = total_wall / total_audio_s if total_audio_s > 0 else 0.0
 
-    print(f"\nDone. {n_total} chunks | "
-          f"{total_audio_s:.1f}s audio | "
-          f"wall {total_wall:.1f}s | avg RTF {avg_rtf:.2f}")
+    rule("Done")
+    success(f"{n_total} chunks | "
+           f"{total_audio_s:.1f}s audio | "
+           f"wall {total_wall:.1f}s | avg RTF {avg_rtf:.2f}")
 
     if wer_log:
         # Duration data is independent of ASR, so this now writes even with
@@ -1356,18 +1353,18 @@ def main():
         if valid_wers:
             avg_wer = sum(e["wer"] for e in valid_wers) / len(valid_wers)
             worst = max(valid_wers, key=lambda e: e["wer"])
-            print(f"ASR summary: avg WER={avg_wer * 100:.1f}% | "
-                  f"total retries={total_retries} | "
-                  f"worst chunk={worst['id']} ({worst['wer'] * 100:.1f}% WER, "
-                  f"{worst['attempts']} attempts)")
+            info(f"ASR summary: avg WER={avg_wer * 100:.1f}% | "
+                f"total retries={total_retries} | "
+                f"worst chunk={worst['id']} ({worst['wer'] * 100:.1f}% WER, "
+                f"{worst['attempts']} attempts)")
 
         duration_failures = [e for e in wer_log if not e["duration_ok"]]
         if args.duration_gate and duration_failures:
             runaways = [e for e in duration_failures
                         if e["duration_reason"] == "runaway"]
-            print(f"Duration gate: {len(duration_failures)}/{len(wer_log)} chunk(s) "
-                  f"never cleanly passed"
-                  + (f" ({len(runaways)} RUNAWAY)" if runaways else "") + ".")
+            warn(f"Duration gate: {len(duration_failures)}/{len(wer_log)} chunk(s) "
+                f"never cleanly passed"
+                + (f" ({len(runaways)} RUNAWAY)" if runaways else "") + ".")
 
         new_entries = {e["id"]: e for e in wer_log}
 
@@ -1386,7 +1383,7 @@ def main():
                     if prior_entry["id"] not in merged:
                         merged[prior_entry["id"]] = prior_entry
             except Exception as e:
-                print(f"WARNING: could not merge prior wer_log: {e}")
+                warn(f"WARNING: could not merge prior wer_log: {e}")
 
         chunks_sorted = [merged[k] for k in sorted(merged)]
         all_wers = [e["wer"] for e in chunks_sorted if e.get("wer") is not None]
@@ -1405,7 +1402,7 @@ def main():
             json.dumps(wer_log_data, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-        print(f"WER log:  {wer_log_path}")
+        info(f"WER log:  {wer_log_path}")
 
     # ── pronunciation diff ─────────────────────────────────────────────────
     # Words the model was asked to say that Whisper heard differently, from
@@ -1475,16 +1472,16 @@ def main():
         diff_txt_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
         n_proper = sum(1 for k in ordered if proper[k])
-        print(f"Pronunciation diff: {diff_txt_path}")
-        print(f"  {len(ordered)} unique mismatched words "
-              f"({n_proper} proper nouns) — review for lexicon candidates.")
+        info(f"Pronunciation diff: {diff_txt_path}")
+        info(f"{len(ordered)} unique mismatched words "
+            f"({n_proper} proper nouns) — review for lexicon candidates.", INDENT2)
     elif asr_model is not None:
-        print("Pronunciation diff: no mismatches found across accepted chunks "
-              "(no pronunciation_diff.json/.txt written).")
+        dim("Pronunciation diff: no mismatches found across accepted chunks "
+           "(no pronunciation_diff.json/.txt written).")
 
-    print(f"Manifest: {manifest_path}")
-    print(f"Next: python scripts/03_stitch.py --run-dir {args.out_dir} "
-          f"--output {args.out_dir / 'final.wav'}")
+    info(f"Manifest: {manifest_path}")
+    success(f"Next: python scripts/03_stitch.py --run-dir {args.out_dir} "
+           f"--output {args.out_dir / 'final.wav'}")
 
     # ── interactive regeneration loop ──────────────────────────────────────
     if args.interactive:
@@ -1503,14 +1500,14 @@ def main():
             try:
                 return _encode_tail_from_wav(pw)
             except Exception as e:
-                print(f"  WARNING could not rebuild carry-over from {pw.name}: "
-                      f"{e}; regenerating without carry-over")
+                warn(f"WARNING could not rebuild carry-over from {pw.name}: "
+                    f"{e}; regenerating without carry-over", INDENT2)
                 return None
 
         def _regen(cid: int, cfg_v: float, temp_v: float, version: int | None = None):
             c = plan_lookup.get(cid)
             if c is None:
-                print(f"  no chunk with id {cid} in the plan.")
+                error(f"no chunk with id {cid} in the plan.", INDENT2)
                 return
             text = resolve_spoken_text(c)
             control = resolve_control(c, args)
@@ -1538,14 +1535,14 @@ def main():
 
             tag = f" v{version}" if version else ""
             carry_str = "yes" if prev_latents else f"no ({carry_reason})"
-            print(f"  regen chunk {cid}{tag} @ cfg={cfg_v} temp={temp_v} "
-                  f"carry={carry_str}: "
-                  f"{text[:50]}{'...' if len(text) > 50 else ''}")
+            info(f"regen chunk {cid}{tag} @ cfg={cfg_v} temp={temp_v} "
+                f"carry={carry_str}: "
+                f"{text[:50]}{'...' if len(text) > 50 else ''}", INDENT2)
             regen_target_spw, regen_target_source = resolve_duration_target(
                 accepted_sec_per_word, args.sec_per_word_target, args.baseline_min_chunks,
             )
             if args.duration_gate:
-                print(f"    [duration] target: {regen_target_source}")
+                dim(f"[duration] target: {regen_target_source}", INDENT2 * 2)
             wav, wer, att, _tr, spw, dok, dreason = generate_with_retry(
                 server=server, text=target_text, prompt_id=prompt_id,
                 ref_latents=chunk_ref, zero_shot_latents=zero_shot_latents,
@@ -1582,16 +1579,17 @@ def main():
                 )
             wtxt = f" WER={wer*100:.1f}%" if wer >= 0 else ""
             ftxt = f" [{', '.join(flags)}]" if flags else ""
-            print(f"  wrote {outp.name} ({len(wav)/sample_rate:.1f}s{wtxt}{ftxt})")
+            (warn if flags else success)(
+                f"wrote {outp.name} ({len(wav)/sample_rate:.1f}s{wtxt}{ftxt})", INDENT2)
 
         def _candidates(cid: int, k: int, cfg_v: float, temp_v: float):
             """Generate k candidate versions of a chunk as _v1.._vk."""
-            print(f"  generating {k} candidates of chunk {cid} "
-                  f"@ cfg={cfg_v} temp={temp_v} ...")
+            info(f"generating {k} candidates of chunk {cid} "
+                f"@ cfg={cfg_v} temp={temp_v} ...", INDENT2)
             for v in range(1, k + 1):
                 _regen(cid, cfg_v, temp_v, version=v)
-            print(f"  done. Listen to chunk_{cid:04d}_v1.. and record your pick "
-                  f"in selection.json (e.g. {{\"{cid}\": 2}}).")
+            dim(f"done. Listen to chunk_{cid:04d}_v1.. and record your pick "
+               f"in selection.json (e.g. {{\"{cid}\": 2}}).", INDENT2)
 
         # Build/refresh the id->chunk lookup from the current plan.
         def _load_plan_lookup():
@@ -1600,22 +1598,16 @@ def main():
 
         plan_lookup = _load_plan_lookup()
 
-        print("\n" + "=" * 60)
-        print("INTERACTIVE MODE — model stays loaded.")
-        print("  <id>                  regenerate that chunk")
-        print("  <id> --cfg 1.7 --temp 0.9   with overrides")
-        print("  cand <id> <k>         generate k candidate versions (_v1.._vk)")
-        print("  cand <id> <k> --cfg 1.7 --temp 0.9   candidates with settings")
-        print("  reload                re-read plan.json (after lexicon/plan edits)")
-        print("  list                  show chunk ids + text starts")
-        print("  quit                  exit")
-        print("=" * 60)
+        console.print()
+        rule("INTERACTIVE MODE — model stays loaded")
+        console.print(command_table())
+        console.print()
 
         while True:
             try:
-                raw = input("regen> ").strip()
+                raw = console.input("[bold cyan]regen> [/]").strip()
             except (EOFError, KeyboardInterrupt):
-                print()
+                console.print()
                 break
             if not raw:
                 continue
@@ -1623,12 +1615,12 @@ def main():
                 break
             if raw == "reload":
                 plan_lookup = _load_plan_lookup()
-                print(f"  plan reloaded ({len(plan_lookup)} chunks).")
+                info(f"plan reloaded ({len(plan_lookup)} chunks).", INDENT2)
                 continue
             if raw == "list":
                 for k in sorted(plan_lookup):
                     t = resolve_spoken_text(plan_lookup[k])
-                    print(f"  {k:3d}  {t[:60]}{'...' if len(t) > 60 else ''}")
+                    plain(f"{k:3d}  {t[:60]}{'...' if len(t) > 60 else ''}", INDENT2)
                 continue
             # candidate command: cand <id> <k> [--cfg X] [--temp Y]
             if raw.startswith("cand"):
@@ -1646,7 +1638,7 @@ def main():
                         else:
                             i += 1
                 except (ValueError, IndexError):
-                    print("  usage: cand <id> <k> [--cfg X] [--temp Y]")
+                    error("usage: cand <id> <k> [--cfg X] [--temp Y]", INDENT2)
                     continue
                 _candidates(cid, k, cfg_v, temp_v)
                 continue
@@ -1664,7 +1656,7 @@ def main():
                     else:
                         i += 1
             except (ValueError, IndexError):
-                print("  usage: <id> [--cfg X] [--temp Y] | cand <id> <k> | reload | list | quit")
+                error("usage: <id> [--cfg X] [--temp Y] | cand <id> <k> | reload | list | quit", INDENT2)
                 continue
             _regen(cid, cfg_v, temp_v)
 

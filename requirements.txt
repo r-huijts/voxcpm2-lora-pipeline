@@ -11,6 +11,7 @@ nano-vllm-voxcpm         # vllm-style serving backend with LoRA + prosody carry-
 torchaudio               # reference-clip load/resample to model sample rate
 faster-whisper>=1.0.0    # ASR for the per-chunk WER quality gate (CTranslate2 Whisper)
 jiwer>=3.0.0             # Word Error Rate computation (Dutch-normalized) for retry loop
+rich>=13.0.0             # colored/tabular console output for the generation log
 
 # Stage 3 — stitch
 numpy>=1.24
