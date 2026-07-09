@@ -1,11 +1,20 @@
 """run_report aggregation for 03_stitch.py (Sub-task 5b).
 
 Aggregates data 03_stitch.py already has in hand -- timeline placement
-(Task 5), wer_log.json's per-chunk WER/duration-gate metrics (Task 2), and
-the candidate selection map -- into one glanceable QA sheet. Pure
-aggregation of already-computed fields, not new measurement.
+(Task 5), wer_log.json's per-chunk WER/duration-gate metrics (Task 2), the
+per-chunk advisory acoustic flags Stage 2 recorded (_audio_metrics.py), and
+the candidate selection map -- into one glanceable QA sheet. The only
+measurement synthesized here is the chunk-vs-neighbours loudness consistency
+check, which needs all chunks side by side and the loudness of the takes
+that actually shipped (selection.json picks included).
+
+Acoustic flags are ADVISORY (triage: which chunks to listen to first) and
+kept apart from `warnings`, which reflect the hard WER/duration gates --
+an advisory never counts as a gate failure.
 """
 import statistics
+
+from _audio_metrics import loudness_outliers
 
 
 def build_report_rows(timeline_entries: list, wer_by_id: dict, selection: dict,
@@ -48,7 +57,16 @@ def build_report_rows(timeline_entries: list, wer_by_id: dict, selection: dict,
             "duration_reason": duration_reason,
             "candidate_version": selection.get(cid),
             "warnings": warnings,
+            "rms_dbfs": e.get("rms_dbfs"),
+            "audio_flags": list(w.get("audio_flags") or []),
         })
+
+    # Chunk-vs-neighbours loudness consistency, on the takes that actually
+    # shipped (rms_dbfs comes from the stitch loop, after selection.json).
+    outliers = loudness_outliers({r["id"]: r["rms_dbfs"] for r in rows})
+    for r in rows:
+        if r["id"] in outliers:
+            r["audio_flags"].append(f"loudness_outlier({outliers[r['id']]:+.1f}dB)")
     return rows
 
 
@@ -64,13 +82,14 @@ def compute_totals(rows: list, total_audio_seconds: float) -> dict:
         "mean_wer": round(statistics.mean(wers), 4) if wers else None,
         "total_retries": sum(retries) if retries else 0,
         "gate_failures": sum(1 for r in rows if r["warnings"]),
+        "acoustic_advisories": sum(1 for r in rows if r.get("audio_flags")),
     }
 
 
 def format_report_txt(run_dir_label: str, output_label: str, rows: list, totals: dict) -> str:
     lines = [f"Run report — {run_dir_label}", f"Output: {output_label}", ""]
     header = (f"{'id':>4}  {'WER':>7}  {'WPM':>6}  {'dur(s)':>7}  "
-              f"{'retries':>7}  {'dur_gate':>10}  {'cand':>5}  warnings")
+              f"{'retries':>7}  {'dur_gate':>10}  {'cand':>5}  warnings / advisory")
     lines.append(header)
     lines.append("-" * len(header))
     for r in rows:
@@ -81,6 +100,9 @@ def format_report_txt(run_dir_label: str, output_label: str, rows: list, totals:
         gate_str = "ok" if r["duration_ok"] else (r["duration_reason"] or "n/a")
         cand_str = str(r["candidate_version"]) if r["candidate_version"] is not None else "-"
         warn_str = "; ".join(r["warnings"])
+        flags = r.get("audio_flags") or []
+        if flags:
+            warn_str = (warn_str + "; " if warn_str else "") + "advisory: " + ", ".join(flags)
         lines.append(f"{r['id']:>4}  {wer_str:>7}  {wpm_str:>6}  {dur_str:>7}  "
                       f"{retries_str:>7}  {gate_str:>10}  {cand_str:>5}  {warn_str}")
     lines.append("-" * len(header))
@@ -89,6 +111,7 @@ def format_report_txt(run_dir_label: str, output_label: str, rows: list, totals:
         f"Totals: {totals['chunk_count']} chunks | {totals['total_audio_seconds']}s audio | "
         f"mean WPM={totals['mean_wpm']} | median WPM={totals['median_wpm']} | "
         f"mean WER={mean_wer_str} | total retries={totals['total_retries']} | "
-        f"gate failures={totals['gate_failures']}"
+        f"gate failures={totals['gate_failures']} | "
+        f"acoustic advisories={totals.get('acoustic_advisories', 0)}"
     )
     return "\n".join(lines) + "\n"

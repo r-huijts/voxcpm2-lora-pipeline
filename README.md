@@ -258,6 +258,19 @@ the running median of accepted chunks after `--baseline-min-chunks` (default 5);
 override it directly with `--sec-per-word-target`. Disable entirely with
 `--no-duration-gate`.
 
+**Advisory acoustic metrics.** Waveform analysis measures technical and
+prosodic quality, not intelligibility — the two gates above own that — so
+alongside them every accepted chunk's waveform is also *measured, never
+gated on* (`scripts/_audio_metrics.py`): peak/RMS level and clipping,
+leading/trailing silence and edge abruptness (a take cut mid-decay can pass
+WER — Whisper still hears the word), and pitch/energy contour variation (a
+monotone chunk passes both hard gates too; this is the only automatic signal
+for it). Flags like `flat_pitch`, `clipping`, `low_level` or `abrupt_end`
+are printed in the console, stored per chunk in `wer_log.json` and the
+journal, and surfaced in the run report — as hard gates these thresholds
+would over-reject, as triage they tell you which chunks to listen to first.
+Thresholds are constants at the top of `_audio_metrics.py`.
+
 **Crash recovery.** `manifest.json` is written up front (its contents derive
 from the plan, not from generation), and every accepted chunk is appended —
 flushed to disk immediately — to `journal.jsonl` in `--out-dir`. A run killed
@@ -279,8 +292,13 @@ regeneration without a reload.
 land differently across attempts, especially in Hi-Fi mode where control tags
 don't steer delivery at all. `--only-chunks 7 --candidates 3` generates three
 takes as `chunk_0007_v1.wav`..`v3.wav` without touching the plain
-`chunk_0007.wav` or needing `--interactive`. Listen, then record your pick in
-`selection.json` (`{"7": 2}`) and re-run `03_stitch.py`.
+`chunk_0007.wav` or needing `--interactive`. Every take is scored with the
+advisory acoustic metrics and a **suggested listening order** is printed and
+written to `chunk_0007_candidates.json` (duration gate first, then fewest
+advisory flags, then WER, then the liveliest pitch contour) — a pre-listening
+filter for where to start, not a verdict: the ear test still decides. Listen,
+then record your pick in `selection.json` (`{"7": 2}`) and re-run
+`03_stitch.py`.
 
 **Running Stage 2 + 3 together.** Unlike chunk → generate, generate → stitch
 never needs a manual pause in between, so `scripts/generate_and_stitch.py`
@@ -331,9 +349,16 @@ file would ship exactly the take you rejected.
   (pre-normalization) wording.
 - `run_report.txt` / `.json`, in `--run-dir` — a QA sheet combining the
   timeline with `wer_log.json` (WER, pace, retries, duration-gate pass/fail,
-  RUNAWAY flags) and any candidate picks — one glanceable table instead of
-  three separate files. Regenerates every time you re-stitch, e.g. after
-  updating `selection.json`.
+  RUNAWAY flags), Stage 2's advisory acoustic flags, and any candidate picks —
+  one glanceable table instead of three separate files. The stitcher also
+  measures each shipped take's loudness (post-trim, selection picks included —
+  a candidate take Stage 2's log never saw is still judged) and flags
+  **chunk-vs-neighbours loudness outliers** (>3 dB off the nearby median):
+  final `--loudnorm` normalizes the whole timeline, not chunks relative to
+  each other, so a chunk generated quieter than its neighbours stays
+  relatively quiet without this check. Advisories never count as gate
+  failures. Regenerates every time you re-stitch, e.g. after updating
+  `selection.json`.
 
 ## Notes
 

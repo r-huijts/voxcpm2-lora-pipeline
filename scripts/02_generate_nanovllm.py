@@ -96,6 +96,7 @@ from _duration_gate import (
     select_best_attempt,
 )
 from _streaming import collect_chunks
+from _audio_metrics import compute_metrics, derive_flags, rank_candidates
 from _journal import append_chunk_record, journal_path, read_chunk_records, reset_journal
 
 # ── silence harmless third-party noise ─────────────────────────────────────
@@ -226,9 +227,11 @@ def resolve_control(c: dict, args) -> str:
 
 
 def wer_log_entry(cid: int, wer: float, attempts: int, sec_per_word: float,
-                  duration_ok: bool, duration_reason: str) -> dict:
+                  duration_ok: bool, duration_reason: str,
+                  audio_metrics: dict | None = None,
+                  audio_flags: list | None = None) -> dict:
     """One chunk's wer_log.json entry -- also what goes in the journal."""
-    return {
+    entry = {
         "id": cid,
         "wer": round(wer, 4) if wer >= 0 else None,
         "attempts": attempts,
@@ -236,6 +239,24 @@ def wer_log_entry(cid: int, wer: float, attempts: int, sec_per_word: float,
         "duration_ok": duration_ok,
         "duration_reason": duration_reason,
     }
+    if audio_metrics is not None:
+        entry["audio_metrics"] = audio_metrics
+        entry["audio_flags"] = audio_flags or []
+    return entry
+
+
+def analyze_chunk_audio(wav, sr: int) -> tuple[dict | None, list[str]]:
+    """
+    Advisory waveform metrics + flags for an accepted take (see
+    _audio_metrics.py). Never a retry trigger, and a failure here must not
+    kill the run -- the chunk itself is already accepted.
+    """
+    try:
+        metrics = compute_metrics(wav, sr)
+        return metrics, derive_flags(metrics)
+    except Exception as e:
+        print(f"         [metrics] WARNING: waveform analysis failed: {e}")
+        return None, []
 
 
 def _normalize_for_wer(text: str) -> str:
@@ -1172,6 +1193,7 @@ def main():
         if args.candidates:
             print(f"[{cid:03d}/{n_total:03d}] generating {args.candidates} candidates "
                   f"(chunk_{cid:04d}_v1..v{args.candidates}.wav; plain file untouched)")
+            cand_entries = []
             for version in range(1, args.candidates + 1):
                 v_wav, v_wer, v_attempts, _tr, v_spw, v_dur_ok, v_dur_reason = generate_with_retry(
                     server=server,
@@ -1196,10 +1218,36 @@ def main():
                 )
                 version_path = args.out_dir / f"chunk_{cid:04d}_v{version}.wav"
                 sf.write(version_path, v_wav, sample_rate, subtype="PCM_16")
+                v_metrics, v_flags = analyze_chunk_audio(v_wav, sample_rate)
+                cand_entries.append({
+                    "version": version,
+                    "file": version_path.name,
+                    "wer": round(v_wer, 4) if v_wer >= 0 else None,
+                    "sec_per_word": round(v_spw, 4) if v_spw else None,
+                    "duration_ok": v_dur_ok,
+                    "duration_reason": v_dur_reason,
+                    "flags": v_flags,
+                    "metrics": v_metrics,
+                })
                 wer_str = f" WER={v_wer * 100:.1f}%" if v_wer >= 0 else ""
                 dur_str = f" {v_spw:.2f}s/word" if args.duration_gate else ""
+                flag_str = f" [{', '.join(v_flags)}]" if v_flags else ""
                 print(f"         v{version}: {len(v_wav) / sample_rate:.1f}s{wer_str}"
-                      f"{dur_str} -> {version_path.name}")
+                      f"{dur_str}{flag_str} -> {version_path.name}")
+            # Pre-listening sort order (see _audio_metrics.rank_candidates):
+            # a filter for where to START listening, not a verdict -- the ear
+            # test still decides what goes in selection.json.
+            ranked = rank_candidates(cand_entries)
+            cand_report_path = args.out_dir / f"chunk_{cid:04d}_candidates.json"
+            cand_report_path.write_text(
+                json.dumps({"id": cid, "ranking": [e["version"] for e in ranked],
+                            "candidates": cand_entries},
+                           ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            rank_str = " > ".join(f"v{e['version']}" for e in ranked)
+            print(f"         [metrics] suggested listening order: {rank_str} "
+                  f"(details: {cand_report_path.name})")
             print(f"         Listen to chunk_{cid:04d}_v1..v{args.candidates}.wav and "
                   f"record your pick in selection.json (e.g. {{\"{cid}\": 2}}), "
                   f"then re-run 03_stitch.py.")
@@ -1240,8 +1288,11 @@ def main():
         n_done += 1
         retries_this_chunk = attempts - 1
         total_retries += retries_this_chunk
+        audio_metrics, audio_flags = analyze_chunk_audio(wav, sample_rate)
         entry = wer_log_entry(cid, chunk_wer, attempts, sec_per_word,
-                              duration_ok, duration_reason)
+                              duration_ok, duration_reason,
+                              audio_metrics=audio_metrics,
+                              audio_flags=audio_flags)
         wer_log.append(entry)
 
         # Journal this chunk NOW (flushed to disk): if the run crashes later,
@@ -1267,6 +1318,9 @@ def main():
                      if retries_this_chunk > 0 else "")
         print(f"         audio={chunk_audio_s:.1f}s wall={chunk_wall:.1f}s "
               f"RTF={rtf:.2f}{wer_str}{retry_str} ETA={eta_str}")
+        if audio_flags:
+            print(f"         [metrics] advisory: {', '.join(audio_flags)} "
+                  f"(triage hint, not a gate -- worth a listen)")
 
         # Encode tail for prosody carry-over. A failure here must not kill the
         # run (the chunk itself is already accepted and on disk) nor leave a
@@ -1515,6 +1569,7 @@ def main():
             else:
                 outp = args.out_dir / f"chunk_{cid:04d}_v{version}.wav"
             sf.write(outp, wav, sample_rate, subtype="PCM_16")
+            metrics, flags = analyze_chunk_audio(wav, sample_rate)
             if version is None:
                 # A canonical regen replaces chunk_NNNN.wav, so journal the new
                 # take's quality data too -- otherwise the journal (and any
@@ -1522,10 +1577,12 @@ def main():
                 # longer on disk. Candidate takes (_vK) aren't journaled.
                 append_chunk_record(
                     jpath, cid,
-                    wer_log_entry(cid, wer, att, spw, dok, dreason),
+                    wer_log_entry(cid, wer, att, spw, dok, dreason,
+                                  audio_metrics=metrics, audio_flags=flags),
                 )
             wtxt = f" WER={wer*100:.1f}%" if wer >= 0 else ""
-            print(f"  wrote {outp.name} ({len(wav)/sample_rate:.1f}s{wtxt})")
+            ftxt = f" [{', '.join(flags)}]" if flags else ""
+            print(f"  wrote {outp.name} ({len(wav)/sample_rate:.1f}s{wtxt}{ftxt})")
 
         def _candidates(cid: int, k: int, cfg_v: float, temp_v: float):
             """Generate k candidate versions of a chunk as _v1.._vk."""

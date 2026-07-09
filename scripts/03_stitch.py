@@ -50,6 +50,7 @@ import soundfile as sf
 from _pipeline_config import default_voice_config_path, load_voice_config, apply_config_defaults
 from _plan_schema import resolve_source_text
 from _srt import build_srt
+from _audio_metrics import rms_dbfs
 from _run_report import build_report_rows, compute_totals, format_report_txt
 
 
@@ -304,6 +305,14 @@ def main():
             "end_samples": end_samples,
             "gap_samples": gap_samples,
             "source_text": resolve_source_text(item),
+            # Loudness of the take that actually ships (post-trim, so edge
+            # silence doesn't skew it) -- measured HERE rather than reused
+            # from Stage 2 because selection.json may swap in a candidate
+            # take Stage 2's wer_log never measured. Feeds the run report's
+            # chunk-vs-neighbours consistency check: final --loudnorm
+            # normalizes the whole timeline, not chunks relative to each
+            # other, so a relatively quiet chunk stays quiet without it.
+            "rms_dbfs": rms_dbfs(audio),
         })
 
     # Optional loudness normalization (in-memory, pyloudnorm). Amplitude
